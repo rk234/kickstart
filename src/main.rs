@@ -1,43 +1,25 @@
-use serde::{Deserialize, Serialize};
+mod cli;
+mod config;
 
-#[derive(Serialize, Deserialize, Debug)]
-enum ReadyCondition {
-    ExitCode(i32),
-    Port(u32),
-    NoOp,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ServiceConfig {
-    name: String,
-    ready_condition: ReadyCondition,
-    depends_on: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct IgniteConfig {
-    service: Vec<ServiceConfig>,
-}
+use clap::Parser;
 
 fn main() {
-    let content = r#"
-        [[service]]
-        name = "My Service 1"
-        dependencies = []
-        [[service]]
-        name = "My Service 2"
-        dependencies = []
-    "#;
+    let cli = cli::Cli::parse();
 
-    // Parse TOML string to Rust struct
-    let config: IgniteConfig = IgniteConfig {
-        service: vec![ServiceConfig {
-            name: String::from("test"),
-            ready_condition: ReadyCondition::NoOp,
-            depends_on: vec![],
-        }],
+    let config = match config::load_config(cli.config.as_deref()) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("{}", err);
+            std::process::exit(1);
+        }
     };
-    // Convert Rust struct back to TOML string
-    let output = toml::to_string_pretty(&config).unwrap();
-    println!("{}", output);
+
+    match cli.command {
+        cli::Commands::Up => println!("Up!!"),
+        cli::Commands::Services => {
+            for name in config.services.keys() {
+                println!("{}", name);
+            }
+        }
+    }
 }
