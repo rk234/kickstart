@@ -1,0 +1,6 @@
+[services]
+[services.test]
+command = "echo 1"
+ready_condition = {
+  delay = 4
+}

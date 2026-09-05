@@ -4,23 +4,25 @@ use serde::{Deserialize, Serialize};
 use toml;
 
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
 pub enum ReadyCondition {
     ExitCode(i32),
     Port(u16),
+    Delay(u64),
     Immediate,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct ServiceConfig {
+pub struct Service {
     pub name: Option<String>,
     pub command: String,
     pub ready_condition: ReadyCondition,
-    pub depends_on: Option<Vec<String>>,
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct IgniteConfig {
-    pub services: HashMap<String, ServiceConfig>,
+    pub services: HashMap<String, Service>,
 }
 
 #[derive(Debug)]
