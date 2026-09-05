@@ -169,7 +169,7 @@ mod tests {
             name: None,
             command: command.to_owned(),
             ready_condition,
-            depends_on: None,
+            depends_on: Vec::new(),
         }
     }
 

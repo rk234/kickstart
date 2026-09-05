@@ -17,6 +17,7 @@ pub struct Service {
     pub name: Option<String>,
     pub command: String,
     pub ready_condition: ReadyCondition,
+    #[serde(default)]
     pub depends_on: Vec<String>,
 }
 
@@ -81,7 +82,7 @@ mod tests {
             r#"
             [services.web]
             command = "echo hi"
-            ready_condition = "Immediate"
+            ready_condition = "immediate"
             "#,
         )
         .unwrap();
@@ -89,7 +90,7 @@ mod tests {
         let web = cfg.services.get("web").unwrap();
         assert_eq!(web.command, "echo hi");
         assert_eq!(web.name, None);
-        assert_eq!(web.depends_on, None);
+        assert!(web.depends_on.is_empty());
         assert!(matches!(web.ready_condition, ReadyCondition::Immediate));
     }
 
@@ -99,12 +100,12 @@ mod tests {
             r#"
             [services.db]
             command = "postgres"
-            ready_condition = { Port = 5432 }
+            ready_condition = { port = 5432 }
 
             [services.web]
             name = "webserver"
             command = "node server.js"
-            ready_condition = { ExitCode = 0 }
+            ready_condition = { exitcode = 0 }
             depends_on = ["db"]
             "#,
         )
@@ -117,7 +118,7 @@ mod tests {
 
         let web = cfg.services.get("web").unwrap();
         assert_eq!(web.name.as_deref(), Some("webserver"));
-        assert_eq!(web.depends_on, Some(vec!["db".to_string()]));
+        assert_eq!(web.depends_on, vec!["db".to_string()]);
         assert!(matches!(web.ready_condition, ReadyCondition::ExitCode(0)));
     }
 
@@ -138,7 +139,7 @@ mod tests {
         let result = parse_config(
             r#"
             [services.web]
-            ready_condition = "Immediate"
+            ready_condition = "immediate"
             "#,
         );
         assert!(result.is_err());
@@ -183,7 +184,7 @@ mod tests {
             r#"
             [services.web]
             command = "echo hi"
-            ready_condition = "Immediate"
+            ready_condition = "immediate"
             "#,
         )
         .unwrap();
