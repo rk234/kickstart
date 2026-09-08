@@ -3,7 +3,7 @@ use std::{
     future::pending,
     net::SocketAddr,
     process::{ExitStatus, Stdio},
-    sync::mpsc::Sender,
+    sync::Arc,
     time::Duration,
 };
 
@@ -11,6 +11,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader, Lines},
     net::TcpStream,
     process::{Child, Command},
+    sync::mpsc::UnboundedSender,
     time::{sleep, timeout},
 };
 
@@ -26,7 +27,7 @@ impl Service {
 }
 
 #[derive(Debug)]
-enum SpawnError {
+pub enum SpawnError {
     CmdParseErr,
     ExecErr(std::io::Error),
 }
@@ -59,10 +60,31 @@ pub fn spawn_srv(key: &str, srv: &Service) -> Result<Child, SpawnError> {
 }
 
 #[derive(Debug)]
-enum ServiceEvent {
+pub enum OutputStream {
+    StdOut,
+    StdErr,
+}
+
+#[derive(Debug)]
+pub enum ServiceEvent {
     Ready(String),
     Exit(String, ExitStatus),
-    Output(String, String),
+    Failed(String, String),
+    Output(String, OutputStream, String),
+}
+
+impl ServiceEvent {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Ready(id) | Self::Exit(id, _) | Self::Failed(id, _) | Self::Output(id, _, _) => {
+                id
+            }
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Exit(_, _) | Self::Failed(_, _))
+    }
 }
 
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
@@ -105,7 +127,12 @@ where
     }
 }
 
-pub async fn monitor_srv(id: String, srv: &Service, proc: &mut Child, tx: Sender<ServiceEvent>) {
+pub async fn monitor_srv(
+    id: String,
+    srv: Arc<Service>,
+    mut proc: Child,
+    tx: UnboundedSender<ServiceEvent>,
+) {
     let mut stdout = proc.stdout.take().map(|out| BufReader::new(out).lines());
     let mut stderr = proc.stderr.take().map(|err| BufReader::new(err).lines());
 
@@ -126,15 +153,24 @@ pub async fn monitor_srv(id: String, srv: &Service, proc: &mut Child, tx: Sender
 
         let event = tokio::select! {
             line = next_line(&mut stdout) => match line {
-                Some(line) => ServiceEvent::Output(id.clone(), line),
+                Some(line) => ServiceEvent::Output(id.clone(), OutputStream::StdOut, line),
                 None => { stdout = None; continue; }
             },
             line = next_line(&mut stderr) => match line {
-                Some(line) => ServiceEvent::Output(id.clone(), line),
+                Some(line) => ServiceEvent::Output(id.clone(), OutputStream::StdErr, line),
                 None => { stderr = None; continue; }
             },
             waited = proc.wait(), if status.is_none() => {
-                let Ok(waited) = waited else { return };
+                let waited = match waited {
+                    Ok(waited) => waited,
+                    // The child is unreachable, so no exit status is coming:
+                    // report the failure rather than leaving the supervisor
+                    // waiting on a service that can never end.
+                    Err(err) => {
+                        let _ = tx.send(ServiceEvent::Failed(id, err.to_string()));
+                        return;
+                    }
+                };
                 status = Some(waited);
 
                 match srv.ready_condition {
@@ -162,7 +198,8 @@ pub async fn monitor_srv(id: String, srv: &Service, proc: &mut Child, tx: Sender
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{net::TcpListener, sync::mpsc, time::Instant};
+    use std::{net::TcpListener, time::Instant};
+    use tokio::sync::mpsc;
 
     fn service(command: &str, ready_condition: ReadyCondition) -> Service {
         Service {
@@ -174,11 +211,18 @@ mod tests {
     }
 
     async fn run(command: &str, ready_condition: ReadyCondition) -> Vec<ServiceEvent> {
-        let srv = service(command, ready_condition);
-        let mut proc = spawn_srv("test", &srv).unwrap();
-        let (tx, rx) = mpsc::channel();
-        monitor_srv("test".to_owned(), &srv, &mut proc, tx).await;
-        rx.into_iter().collect()
+        let srv = Arc::new(service(command, ready_condition));
+        let proc = spawn_srv("test", &srv).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        monitor_srv("test".to_owned(), srv, proc, tx).await;
+
+        // The monitor owns the sender, so the channel closes when it returns.
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
     }
 
     fn ready_ids(events: &[ServiceEvent]) -> Vec<&str> {
@@ -236,7 +280,7 @@ mod tests {
         let mut lines: Vec<(&str, &str)> = events
             .iter()
             .filter_map(|event| match event {
-                ServiceEvent::Output(id, line) => Some((id.as_str(), line.as_str())),
+                ServiceEvent::Output(id, _, line) => Some((id.as_str(), line.as_str())),
                 _ => None,
             })
             .collect();
@@ -255,6 +299,74 @@ mod tests {
         let events = run("sh -c 'exit 1'", ReadyCondition::ExitCode(7)).await;
         assert!(ready_ids(&events).is_empty());
         assert!(matches!(events.last(), Some(ServiceEvent::Exit(_, _))));
+    }
+
+    #[test]
+    fn event_accessors_cover_every_variant() {
+        let ready = ServiceEvent::Ready("a".to_owned());
+        let failed = ServiceEvent::Failed("b".to_owned(), "boom".to_owned());
+        let output = ServiceEvent::Output("c".to_owned(), OutputStream::StdOut, "line".to_owned());
+
+        assert_eq!(ready.id(), "a");
+        assert_eq!(failed.id(), "b");
+        assert_eq!(output.id(), "c");
+
+        assert!(failed.is_terminal());
+        assert!(!ready.is_terminal());
+        assert!(!output.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn every_run_reports_exactly_one_terminal_event() {
+        for (command, cond) in [
+            ("sh -c 'echo hi'", ReadyCondition::Immediate),
+            ("sh -c 'exit 2'", ReadyCondition::ExitCode(0)),
+            (
+                "sh -c 'echo out; echo err >&2; exit 1'",
+                ReadyCondition::Delay(10),
+            ),
+        ] {
+            let events = run(command, cond).await;
+            let terminal = events.iter().filter(|e| e.is_terminal()).count();
+            assert_eq!(terminal, 1, "unexpected terminal count for `{}`", command);
+            assert!(events.last().is_some_and(ServiceEvent::is_terminal));
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_runs_as_an_independent_spawned_task() {
+        // Owning its Service and Child is what makes the monitor 'static, so
+        // the supervisor can spawn one per service instead of driving them all.
+        let srv = Arc::new(service("sh -c 'echo hi'", ReadyCondition::Immediate));
+        let proc = spawn_srv("test", &srv).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let handle = tokio::spawn(monitor_srv("test".to_owned(), srv, proc, tx));
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        handle.await.unwrap();
+
+        assert!(events.last().is_some_and(ServiceEvent::is_terminal));
+    }
+
+    #[tokio::test]
+    async fn monitor_gives_up_once_the_receiver_is_gone() {
+        let srv = Arc::new(service(
+            "sh -c 'echo hi; sleep 1'",
+            ReadyCondition::Immediate,
+        ));
+        let proc = spawn_srv("test", &srv).unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+
+        let monitor = monitor_srv("test".to_owned(), srv, proc, tx);
+        assert!(
+            timeout(Duration::from_millis(500), monitor).await.is_ok(),
+            "monitor outlived its receiver"
+        );
     }
 
     #[tokio::test]
