@@ -9,7 +9,7 @@ enum ServiceStatus {
     Ended,
 }
 
-struct Orchestrator {
+pub struct Orchestrator {
     srv_to_status: HashMap<String, ServiceStatus>,
     srv_to_dependents: HashMap<String, Vec<String>>,
 }

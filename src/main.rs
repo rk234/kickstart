@@ -5,49 +5,76 @@ mod orchestrator;
 
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     // sync::mpsc,
 };
 
 use clap::Parser;
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
 use crate::{
     cli::Cli,
     config::IgniteConfig,
+    exec::{ServiceEvent, monitor_srv},
     // exec::{monitor_srv, spawn_srv},
 };
 
-fn dispatch(cli: &Cli, config: &IgniteConfig) {
+async fn dispatch(cli: &Cli, config: &IgniteConfig) {
     match cli.command {
         cli::Commands::Up => {
-            let mut deps: HashMap<String, HashSet<String>> = HashMap::new();
+            let mut orchestrator = orchestrator::Orchestrator::new(&config.services);
 
-            for (id, srv) in &config.services {
-                deps.insert(
-                    id.clone(),
-                    srv.depends_on
-                        .iter()
-                        .map(|d| d.clone())
-                        .into_iter()
-                        .collect(),
-                );
+            let (tx, mut rx): (
+                UnboundedSender<ServiceEvent>,
+                UnboundedReceiver<ServiceEvent>,
+            ) = tokio::sync::mpsc::unbounded_channel();
+
+            while !orchestrator.all_ended() || rx.is_closed() {
+                let fulfilled = orchestrator.fulfilled();
+
+                while let Ok(msg) = rx.try_recv() {
+                    println!("msg: {:?}", msg);
+
+                    match msg {
+                        ServiceEvent::Exit(key, _) => {
+                            orchestrator.mark_ended(&key);
+                        }
+                        ServiceEvent::Ready(key) => {
+                            orchestrator.mark_ready(&key);
+                        }
+                        ServiceEvent::Failed(key, _) => {
+                            orchestrator.mark_ended(&key);
+                        }
+                        ServiceEvent::Output(_, _, _) => {}
+                    }
+                }
+
+                for srv in fulfilled {
+                    let service = Arc::new(config.services[&srv].clone());
+                    match exec::spawn_srv(&srv, &service) {
+                        Ok(child) => {
+                            println!(
+                                "[orchestrator]: spawned {} [{}]",
+                                service.name.clone().unwrap_or(srv.clone()),
+                                srv
+                            );
+
+                            orchestrator.mark_running(&srv);
+
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                monitor_srv(srv, service, child, tx).await;
+                            });
+                        }
+                        Err(e) => eprintln!(
+                            "[orchestrator]: failed to spawn {} [{}]: {}",
+                            service.name.clone().unwrap_or(srv.clone()),
+                            srv,
+                            e
+                        ),
+                    }
+                }
             }
-
-            // let (tx, rx) = mpsc::channel();
-            //
-            // loop {
-            //     let ready: Vec<String> = deps
-            //         .iter()
-            //         .filter(|(k, v)| v.is_empty())
-            //         .map(|(k, _)| k.clone())
-            //         .collect();
-            //
-            //     for id in ready {
-            //         if let Some(srv) = config.services.get(&id) {
-            //             let child = spawn_srv(&id, &srv);
-            //             tokio::spawn(monitor_srv(id.clone(), &srv, &child, tx));
-            //         }
-            //     }
-            // }
         }
         cli::Commands::Services => {
             for name in config.services.keys() {
@@ -57,7 +84,8 @@ fn dispatch(cli: &Cli, config: &IgniteConfig) {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = cli::Cli::parse();
 
     let config = match config::load_config(cli.config.as_deref()) {
@@ -68,5 +96,5 @@ fn main() {
         }
     };
 
-    dispatch(&cli, &config);
+    dispatch(&cli, &config).await;
 }

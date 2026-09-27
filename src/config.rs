@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Display};
 use serde::{Deserialize, Serialize};
 use toml;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum ReadyCondition {
     ExitCode(i32),
@@ -12,7 +12,7 @@ pub enum ReadyCondition {
     Immediate,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Service {
     pub name: Option<String>,
     pub command: String,
