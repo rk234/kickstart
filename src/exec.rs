@@ -17,25 +17,14 @@ use tokio::{
 
 use crate::config::{ReadyCondition, Service};
 
-impl Service {
-    fn create_command_args(&self) -> Option<(String, Vec<String>)> {
-        let toks = shlex::split(&self.command)?;
-        let (prog, args) = toks.split_first()?;
-
-        Some((prog.to_owned(), args.to_owned()))
-    }
-}
-
 #[derive(Debug)]
 pub enum SpawnError {
-    CmdParseErr,
     ExecErr(std::io::Error),
 }
 
 impl Display for SpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CmdParseErr => write!(f, "command parsing error"),
             Self::ExecErr(err) => write!(f, "exec error: {}", err),
         }
     }
@@ -50,9 +39,10 @@ impl From<std::io::Error> for SpawnError {
 impl std::error::Error for SpawnError {}
 
 pub fn spawn_srv(key: &str, srv: &Service) -> Result<Child, SpawnError> {
-    let (prog, args) = srv.create_command_args().ok_or(SpawnError::CmdParseErr)?;
-    let child = Command::new(prog)
-        .args(args)
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg(&srv.command)
+        .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -289,6 +279,34 @@ mod tests {
 
         assert!(matches!(events.first(), Some(ServiceEvent::Ready(_))));
         assert!(matches!(events.last(), Some(ServiceEvent::Exit(_, _))));
+    }
+
+    fn stdout_lines(events: &[ServiceEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ServiceEvent::Output(_, OutputStream::StdOut, line) => Some(line.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn commands_support_shell_sequencing() {
+        let events = run(
+            "echo a && echo b; false && echo skipped; echo c",
+            ReadyCondition::Immediate,
+        )
+        .await;
+        assert_eq!(stdout_lines(&events), ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn service_leads_its_own_process_group() {
+        let events = run("ps -o pgid= -p $$; echo $$", ReadyCondition::Immediate).await;
+        let lines = stdout_lines(&events);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].trim(), lines[1].trim());
     }
 
     #[tokio::test]

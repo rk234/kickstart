@@ -1,6 +1,11 @@
 [services]
 [services.test]
-command = "echo 1"
+command = "sleep 10; echo 1"
 ready_condition = {
-  delay = 4
+  delay = 1000
 }
+
+[services.successor]
+command = "echo 'hi there'"
+depends_on = ['test']
+ready_condition = "immediate"
