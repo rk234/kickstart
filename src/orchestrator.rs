@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::config::Service;
 
@@ -7,6 +7,7 @@ enum ServiceStatus {
     Ready,
     Running,
     Ended,
+    Skipped,
 }
 
 pub struct Orchestrator {
@@ -57,6 +58,39 @@ impl Orchestrator {
         }
     }
 
+    pub fn mark_failed(&mut self, srv: &str) {
+        self.mark_ended(srv);
+
+        let mut q = VecDeque::new();
+        let Some(dependents) = self.srv_to_dependents.get(srv) else {
+            return;
+        };
+
+        q.extend(dependents.clone());
+
+        while let Some(srv) = q.pop_front() {
+            if !self.mark_skipped(&srv) {
+                continue;
+            }
+
+            let Some(dependents) = self.srv_to_dependents.get(&srv) else {
+                continue;
+            };
+            q.extend(dependents.clone());
+        }
+    }
+
+    fn mark_skipped(&mut self, srv: &str) -> bool {
+        let Some(status) = self.srv_to_status.get_mut(srv) else {
+            return false;
+        };
+        if !matches!(status, ServiceStatus::Waiting(_) | ServiceStatus::Ready) {
+            return false;
+        }
+        *status = ServiceStatus::Skipped;
+        true
+    }
+
     pub fn mark_ready(&mut self, srv: &str) {
         let Some(dependents) = self.srv_to_dependents.get(srv) else {
             return;
@@ -84,10 +118,10 @@ impl Orchestrator {
             .collect()
     }
 
-    pub fn all_ended(&self) -> bool {
-        self.srv_to_status
-            .values()
-            .all(|status| matches!(status, ServiceStatus::Ended))
+    pub fn all_ended_or_skipped(&self) -> bool {
+        self.srv_to_status.values().all(|status| {
+            matches!(status, ServiceStatus::Ended) || matches!(status, ServiceStatus::Skipped)
+        })
     }
 }
 
@@ -294,11 +328,11 @@ mod tests {
 
         orch.mark_running("db");
         orch.mark_ready("db");
-        assert!(!orch.all_ended());
+        assert!(!orch.all_ended_or_skipped());
 
         orch.mark_ended("db");
         orch.mark_ended("web");
-        assert!(orch.all_ended());
+        assert!(orch.all_ended_or_skipped());
     }
 
     #[test]
@@ -314,7 +348,7 @@ mod tests {
         let mut orch = orchestrator(&[("db", &[]), ("web", &["db"])]);
         orch.mark_ended("db");
         assert!(orch.fulfilled().is_empty());
-        assert!(!orch.all_ended());
+        assert!(!orch.all_ended_or_skipped());
     }
 
     #[test]
@@ -322,7 +356,7 @@ mod tests {
         let mut orch = orchestrator(&[("db", &[])]);
         orch.mark_ended("nope");
         assert_eq!(fulfilled(&orch), vec!["db"]);
-        assert!(!orch.all_ended());
+        assert!(!orch.all_ended_or_skipped());
     }
 
     #[test]
@@ -330,7 +364,7 @@ mod tests {
         let mut orch = orchestrator(&[("db", &[])]);
         orch.mark_ended("db");
         orch.mark_ended("db");
-        assert!(orch.all_ended());
+        assert!(orch.all_ended_or_skipped());
     }
 
     #[test]
@@ -341,7 +375,48 @@ mod tests {
         orch.mark_ended("db");
         orch.mark_ended("web");
 
-        assert!(orch.all_ended());
+        assert!(orch.all_ended_or_skipped());
+    }
+
+    // --- mark_failed ---
+
+    #[test]
+    fn failing_skips_transitive_dependents() {
+        let mut orch = orchestrator(&[("a", &[]), ("b", &["a"]), ("c", &["b"])]);
+        orch.mark_running("a");
+        orch.mark_failed("a");
+        assert!(orch.fulfilled().is_empty());
+        assert!(orch.all_ended_or_skipped());
+    }
+
+    #[test]
+    fn failing_does_not_skip_running_dependents() {
+        let mut orch = orchestrator(&[("db", &[]), ("web", &["db"])]);
+        orch.mark_running("db");
+        orch.mark_ready("db");
+        orch.mark_running("web");
+
+        orch.mark_failed("db");
+
+        // `web` is still running, so the run is not complete.
+        assert!(!orch.all_ended_or_skipped());
+    }
+
+    #[test]
+    fn failing_terminates_on_dependency_cycles() {
+        let mut orch = orchestrator(&[("x", &[]), ("a", &["b", "x"]), ("b", &["a"])]);
+        orch.mark_running("x");
+        orch.mark_failed("x");
+        assert!(orch.all_ended_or_skipped());
+    }
+
+    #[test]
+    fn failing_skips_diamond_dependents() {
+        let mut orch =
+            orchestrator(&[("a", &[]), ("b", &["a"]), ("c", &["a"]), ("d", &["b", "c"])]);
+        orch.mark_running("a");
+        orch.mark_failed("a");
+        assert!(orch.all_ended_or_skipped());
     }
 
     // --- all_ended ---
@@ -349,24 +424,24 @@ mod tests {
     #[test]
     fn all_ended_is_vacuously_true_without_services() {
         let orch = orchestrator(&[]);
-        assert!(orch.all_ended());
+        assert!(orch.all_ended_or_skipped());
     }
 
     #[test]
     fn all_ended_is_false_while_anything_is_waiting_or_ready() {
         let mut orch = orchestrator(&[("db", &[]), ("web", &["db"])]);
-        assert!(!orch.all_ended());
+        assert!(!orch.all_ended_or_skipped());
 
         run_to_completion(&mut orch, "db");
         // `web` is Ready but has not run yet.
-        assert!(!orch.all_ended());
+        assert!(!orch.all_ended_or_skipped());
     }
 
     #[test]
     fn all_ended_is_false_while_a_service_is_running() {
         let mut orch = orchestrator(&[("db", &[])]);
         orch.mark_running("db");
-        assert!(!orch.all_ended());
+        assert!(!orch.all_ended_or_skipped());
     }
 
     #[test]
@@ -375,10 +450,10 @@ mod tests {
 
         run_to_completion(&mut orch, "a");
         run_to_completion(&mut orch, "b");
-        assert!(!orch.all_ended());
+        assert!(!orch.all_ended_or_skipped());
 
         run_to_completion(&mut orch, "c");
-        assert!(orch.all_ended());
+        assert!(orch.all_ended_or_skipped());
     }
 
     #[test]
@@ -388,6 +463,6 @@ mod tests {
         orch.mark_ready("ghost");
 
         // `web` was released but never ran, so the run is not complete.
-        assert!(!orch.all_ended());
+        assert!(!orch.all_ended_or_skipped());
     }
 }

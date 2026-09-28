@@ -38,12 +38,16 @@ fn spawn_fulfilled(
                     monitor_srv(srv, service, child, tx).await;
                 });
             }
-            Err(e) => eprintln!(
-                "[orchestrator]: failed to spawn {} [{}]: {}",
-                service.name.clone().unwrap_or(srv.clone()),
-                srv,
-                e
-            ),
+            Err(e) => {
+                eprintln!(
+                    "[orchestrator]: failed to spawn {} [{}]: {}",
+                    service.name.clone().unwrap_or(srv.clone()),
+                    srv,
+                    e
+                );
+
+                orchestrator.mark_failed(&srv);
+            }
         }
     }
 }
@@ -51,7 +55,7 @@ fn spawn_fulfilled(
 async fn dispatch(cli: &Cli, config: &IgniteConfig) {
     match cli.command {
         cli::Commands::Up => {
-            let mut orchestrator = orchestrator::Orchestrator::new(&config.services);
+            let mut orchestrator = Orchestrator::new(&config.services);
 
             let (tx, mut rx): (
                 UnboundedSender<ServiceEvent>,
@@ -71,14 +75,14 @@ async fn dispatch(cli: &Cli, config: &IgniteConfig) {
                         orchestrator.mark_ready(&key);
                     }
                     ServiceEvent::Failed(key, _) => {
-                        orchestrator.mark_ended(&key);
+                        orchestrator.mark_failed(&key);
                     }
                     ServiceEvent::Output(_, _, _) => {}
                 }
 
                 spawn_fulfilled(&mut orchestrator, config, tx.clone());
 
-                if orchestrator.all_ended() {
+                if orchestrator.all_ended_or_skipped() {
                     break;
                 }
             }
