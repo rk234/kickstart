@@ -63,20 +63,6 @@ pub enum ServiceEvent {
     Output(String, OutputStream, String),
 }
 
-impl ServiceEvent {
-    pub fn id(&self) -> &str {
-        match self {
-            Self::Ready(id) | Self::Exit(id, _) | Self::Failed(id, _) | Self::Output(id, _, _) => {
-                id
-            }
-        }
-    }
-
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Exit(_, _) | Self::Failed(_, _))
-    }
-}
-
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 const PORT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
