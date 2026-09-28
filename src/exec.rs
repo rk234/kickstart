@@ -38,7 +38,7 @@ impl From<std::io::Error> for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
-pub fn spawn_srv(key: &str, srv: &Service) -> Result<Child, SpawnError> {
+pub fn spawn_srv(_key: &str, srv: &Service) -> Result<Child, SpawnError> {
     let child = Command::new("sh")
         .arg("-c")
         .arg(&srv.command)
