@@ -6,8 +6,15 @@ enum ServiceStatus {
     Waiting(HashSet<String>),
     Ready,
     Running,
+    /// Running and its ready condition has fired.
+    Up,
     Ended,
     Skipped,
+}
+
+pub enum EndOutcome {
+    Ended,
+    Failed { skipped: Vec<String> },
 }
 
 pub struct Orchestrator {
@@ -52,18 +59,32 @@ impl Orchestrator {
         }
     }
 
-    pub fn mark_ended(&mut self, srv: &str) {
-        if let Some(status) = self.srv_to_status.get_mut(srv) {
-            *status = ServiceStatus::Ended;
+    pub fn mark_ended(&mut self, srv: &str) -> EndOutcome {
+        let Some(status) = self.srv_to_status.get_mut(srv) else {
+            return EndOutcome::Ended;
+        };
+        match status {
+            ServiceStatus::Up | ServiceStatus::Ended | ServiceStatus::Skipped => {
+                *status = ServiceStatus::Ended;
+                EndOutcome::Ended
+            }
+            ServiceStatus::Waiting(_) | ServiceStatus::Ready | ServiceStatus::Running => {
+                EndOutcome::Failed {
+                    skipped: self.mark_failed(srv),
+                }
+            }
         }
     }
 
-    pub fn mark_failed(&mut self, srv: &str) {
-        self.mark_ended(srv);
+    pub fn mark_failed(&mut self, srv: &str) -> Vec<String> {
+        if let Some(status) = self.srv_to_status.get_mut(srv) {
+            *status = ServiceStatus::Ended;
+        }
 
+        let mut skipped = Vec::new();
         let mut q = VecDeque::new();
         let Some(dependents) = self.srv_to_dependents.get(srv) else {
-            return;
+            return skipped;
         };
 
         q.extend(dependents.clone());
@@ -72,12 +93,15 @@ impl Orchestrator {
             if !self.mark_skipped(&srv) {
                 continue;
             }
+            skipped.push(srv.clone());
 
             let Some(dependents) = self.srv_to_dependents.get(&srv) else {
                 continue;
             };
             q.extend(dependents.clone());
         }
+
+        skipped
     }
 
     fn mark_skipped(&mut self, srv: &str) -> bool {
@@ -92,6 +116,12 @@ impl Orchestrator {
     }
 
     pub fn mark_ready(&mut self, srv: &str) {
+        if let Some(status) = self.srv_to_status.get_mut(srv)
+            && matches!(status, ServiceStatus::Running)
+        {
+            *status = ServiceStatus::Up;
+        }
+
         let Some(dependents) = self.srv_to_dependents.get(srv) else {
             return;
         };
@@ -343,12 +373,37 @@ mod tests {
     }
 
     #[test]
-    fn marking_ended_does_not_release_dependents() {
-        // Ending without a ready signal leaves dependents blocked.
-        let mut orch = orchestrator(&[("db", &[]), ("web", &["db"])]);
-        orch.mark_ended("db");
+    fn ending_before_ready_fails_and_skips_dependents() {
+        let mut orch = orchestrator(&[("db", &[]), ("web", &["db"]), ("app", &["web"])]);
+        orch.mark_running("db");
+
+        let EndOutcome::Failed { mut skipped } = orch.mark_ended("db") else {
+            panic!("db ended before ready but was not failed");
+        };
+        skipped.sort();
+        assert_eq!(skipped, ["app", "web"]);
         assert!(orch.fulfilled().is_empty());
-        assert!(!orch.all_ended_or_skipped());
+        assert!(orch.all_ended_or_skipped());
+    }
+
+    #[test]
+    fn ending_after_ready_does_not_skip_dependents() {
+        let mut orch = orchestrator(&[("db", &[]), ("web", &["db"])]);
+        orch.mark_running("db");
+        orch.mark_ready("db");
+
+        assert!(matches!(orch.mark_ended("db"), EndOutcome::Ended));
+        assert_eq!(fulfilled(&orch), vec!["web"]);
+    }
+
+    #[test]
+    fn a_failed_service_without_dependents_still_reports_failure() {
+        let mut orch = orchestrator(&[("db", &[])]);
+        orch.mark_running("db");
+        assert!(matches!(
+            orch.mark_ended("db"),
+            EndOutcome::Failed { skipped } if skipped.is_empty()
+        ));
     }
 
     #[test]
