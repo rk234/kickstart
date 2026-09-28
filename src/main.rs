@@ -3,14 +3,10 @@ mod config;
 mod exec;
 mod orchestrator;
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    // sync::mpsc,
-};
+use std::sync::Arc;
 
 use clap::Parser;
-use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::{
     cli::Cli,
