@@ -16,8 +16,41 @@ use crate::{
     cli::Cli,
     config::IgniteConfig,
     exec::{ServiceEvent, monitor_srv},
+    orchestrator::Orchestrator,
     // exec::{monitor_srv, spawn_srv},
 };
+
+fn spawn_fulfilled(
+    orchestrator: &mut Orchestrator,
+    config: &IgniteConfig,
+    tx: UnboundedSender<ServiceEvent>,
+) {
+    for srv in orchestrator.fulfilled() {
+        let service = Arc::new(config.services[&srv].clone());
+        match exec::spawn_srv(&srv, &service) {
+            Ok(child) => {
+                println!(
+                    "[orchestrator]: spawned {} [{}]",
+                    service.name.clone().unwrap_or(srv.clone()),
+                    srv
+                );
+
+                orchestrator.mark_running(&srv);
+
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    monitor_srv(srv, service, child, tx).await;
+                });
+            }
+            Err(e) => eprintln!(
+                "[orchestrator]: failed to spawn {} [{}]: {}",
+                service.name.clone().unwrap_or(srv.clone()),
+                srv,
+                e
+            ),
+        }
+    }
+}
 
 async fn dispatch(cli: &Cli, config: &IgniteConfig) {
     match cli.command {
@@ -29,50 +62,28 @@ async fn dispatch(cli: &Cli, config: &IgniteConfig) {
                 UnboundedReceiver<ServiceEvent>,
             ) = tokio::sync::mpsc::unbounded_channel();
 
-            while !orchestrator.all_ended() || rx.is_closed() {
-                let fulfilled = orchestrator.fulfilled();
+            spawn_fulfilled(&mut orchestrator, config, tx.clone());
 
-                while let Ok(msg) = rx.try_recv() {
-                    println!("msg: {:?}", msg);
+            while let Some(msg) = rx.recv().await {
+                println!("msg: {:?}", msg);
 
-                    match msg {
-                        ServiceEvent::Exit(key, _) => {
-                            orchestrator.mark_ended(&key);
-                        }
-                        ServiceEvent::Ready(key) => {
-                            orchestrator.mark_ready(&key);
-                        }
-                        ServiceEvent::Failed(key, _) => {
-                            orchestrator.mark_ended(&key);
-                        }
-                        ServiceEvent::Output(_, _, _) => {}
+                match msg {
+                    ServiceEvent::Exit(key, _) => {
+                        orchestrator.mark_ended(&key);
                     }
+                    ServiceEvent::Ready(key) => {
+                        orchestrator.mark_ready(&key);
+                    }
+                    ServiceEvent::Failed(key, _) => {
+                        orchestrator.mark_ended(&key);
+                    }
+                    ServiceEvent::Output(_, _, _) => {}
                 }
 
-                for srv in fulfilled {
-                    let service = Arc::new(config.services[&srv].clone());
-                    match exec::spawn_srv(&srv, &service) {
-                        Ok(child) => {
-                            println!(
-                                "[orchestrator]: spawned {} [{}]",
-                                service.name.clone().unwrap_or(srv.clone()),
-                                srv
-                            );
+                spawn_fulfilled(&mut orchestrator, config, tx.clone());
 
-                            orchestrator.mark_running(&srv);
-
-                            let tx = tx.clone();
-                            tokio::spawn(async move {
-                                monitor_srv(srv, service, child, tx).await;
-                            });
-                        }
-                        Err(e) => eprintln!(
-                            "[orchestrator]: failed to spawn {} [{}]: {}",
-                            service.name.clone().unwrap_or(srv.clone()),
-                            srv,
-                            e
-                        ),
-                    }
+                if orchestrator.all_ended() {
+                    break;
                 }
             }
         }
