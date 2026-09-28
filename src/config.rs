@@ -1,7 +1,6 @@
 use std::{collections::HashMap, fmt::Display};
 
 use serde::{Deserialize, Serialize};
-use toml;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -45,13 +44,13 @@ impl std::error::Error for LoadError {}
 
 impl From<std::io::Error> for LoadError {
     fn from(value: std::io::Error) -> Self {
-        return Self::IoError(value);
+        Self::IoError(value)
     }
 }
 
 impl From<toml::de::Error> for LoadError {
     fn from(value: toml::de::Error) -> Self {
-        return Self::DeserializeError(value);
+        Self::DeserializeError(value)
     }
 }
 
