@@ -1,6 +1,9 @@
 use std::{io::Write, sync::Arc};
 
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    mpsc::{UnboundedReceiver, UnboundedSender},
+    watch,
+};
 
 use crate::{
     config::IgniteConfig,
@@ -12,16 +15,47 @@ use crate::{
 pub async fn run(config: &IgniteConfig) {
     let mut orchestrator = Orchestrator::new(&config.services);
     let mut logger = Logger::stdout();
+    let mut shutting_down = false;
+
     logger.register(config.services.keys().map(String::as_str));
 
-    let (tx, mut rx): (
+    let (event_tx, mut event_rx): (
         UnboundedSender<ServiceEvent>,
         UnboundedReceiver<ServiceEvent>,
     ) = tokio::sync::mpsc::unbounded_channel();
 
-    spawn_fulfilled(&mut orchestrator, config, &mut logger, tx.clone());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    while let Some(msg) = rx.recv().await {
+    let mut spawned = Vec::new();
+    spawned.extend(spawn_fulfilled(
+        &mut orchestrator,
+        config,
+        &mut logger,
+        event_tx.clone(),
+        shutdown_rx.clone(),
+    ));
+
+    loop {
+        let msg = tokio::select! {
+            msg = event_rx.recv() => match msg {
+                Some(msg) => msg,
+                None => break
+            },
+            _ = tokio::signal::ctrl_c() => {
+                shutting_down = true;
+                match shutdown_tx.send(true) {
+                    Ok(_) => {
+                        orchestrator.skip_pending();
+                        logger.orchestrator(Level::Notice, "sutting down");
+                    },
+                    Err(_) => {
+                        logger.orchestrator(Level::Error, "failed to send shutdown signal!");
+                    }
+                };
+                continue;
+            }
+        };
+
         match msg {
             ServiceEvent::Exit(key, status) => match orchestrator.mark_ended(&key) {
                 EndOutcome::Failed { skipped } => {
@@ -56,7 +90,15 @@ pub async fn run(config: &IgniteConfig) {
             }
         }
 
-        spawn_fulfilled(&mut orchestrator, config, &mut logger, tx.clone());
+        if !shutting_down {
+            spawned.extend(spawn_fulfilled(
+                &mut orchestrator,
+                config,
+                &mut logger,
+                event_tx.clone(),
+                shutdown_rx.clone(),
+            ));
+        }
 
         if orchestrator.all_ended_or_skipped() {
             break;
@@ -78,7 +120,9 @@ fn spawn_fulfilled<W: Write>(
     config: &IgniteConfig,
     logger: &mut Logger<W>,
     tx: UnboundedSender<ServiceEvent>,
-) {
+    shutdown_rx: watch::Receiver<bool>,
+) -> Vec<(String, u32)> {
+    let mut spawned = Vec::new();
     for srv in orchestrator.fulfilled() {
         let service = Arc::new(config.services[&srv].clone());
         let name = service.name.clone().unwrap_or(srv.clone());
@@ -88,9 +132,13 @@ fn spawn_fulfilled<W: Write>(
 
                 orchestrator.mark_running(&srv);
 
+                if let Some(pid) = child.id() {
+                    spawned.push((srv.clone(), pid));
+                }
                 let tx = tx.clone();
+                let shutdown_rx = shutdown_rx.clone();
                 tokio::spawn(async move {
-                    monitor_srv(srv, service, child, tx).await;
+                    monitor_srv(srv, service, child, tx, shutdown_rx).await;
                 });
             }
             Err(e) => {
@@ -104,4 +152,6 @@ fn spawn_fulfilled<W: Write>(
             }
         }
     }
+
+    spawned
 }

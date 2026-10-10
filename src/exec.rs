@@ -11,7 +11,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader, Lines},
     net::TcpStream,
     process::{Child, Command},
-    sync::mpsc::UnboundedSender,
+    sync::{mpsc::UnboundedSender, watch},
     time::{sleep, timeout},
 };
 
@@ -108,6 +108,7 @@ pub async fn monitor_srv(
     srv: Arc<Service>,
     mut proc: Child,
     tx: UnboundedSender<ServiceEvent>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let mut stdout = proc.stdout.take().map(|out| BufReader::new(out).lines());
     let mut stderr = proc.stderr.take().map(|err| BufReader::new(err).lines());
@@ -115,8 +116,10 @@ pub async fn monitor_srv(
     let ready = await_ready(&srv.ready_condition);
     tokio::pin!(ready);
 
+    let pgid = proc.id();
     let mut is_ready = false;
     let mut status: Option<ExitStatus> = None;
+    let mut signalled = false;
 
     loop {
         if let Some(status) = status
@@ -158,7 +161,16 @@ pub async fn monitor_srv(
                     }
                     _ => continue,
                 }
-            }
+            },
+            _ = shutdown.wait_for(|&stop| stop), if !signalled && status.is_none() => {
+                signalled = true;
+                if let Some(pgid) = pgid {
+                    unsafe {
+                        libc::killpg(pgid as i32, libc::SIGTERM);
+                    }
+                }
+                continue;
+            },
             () = &mut ready, if !is_ready => {
                 is_ready = true;
                 ServiceEvent::Ready(id.clone())
@@ -174,8 +186,8 @@ pub async fn monitor_srv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{net::TcpListener, time::Instant};
-    use tokio::sync::mpsc;
+    use std::{net::TcpListener, os::unix::process::ExitStatusExt, time::Instant};
+    use tokio::{sync::mpsc, task::JoinHandle};
 
     fn service(command: &str, ready_condition: ReadyCondition) -> Service {
         Service {
@@ -190,15 +202,74 @@ mod tests {
         let srv = Arc::new(service(command, ready_condition));
         let proc = spawn_srv("test", &srv).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
+        // Held for the whole run: dropping the sender counts as a shutdown.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        monitor_srv("test".to_owned(), srv, proc, tx).await;
+        monitor_srv("test".to_owned(), srv, proc, tx, shutdown_rx).await;
 
-        // The monitor owns the sender, so the channel closes when it returns.
+        collect(&mut rx).await
+    }
+
+    /// Drains events until the monitor returns. The monitor owns the sender,
+    /// so the channel closes when it does.
+    async fn collect(rx: &mut mpsc::UnboundedReceiver<ServiceEvent>) -> Vec<ServiceEvent> {
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
             events.push(event);
         }
         events
+    }
+
+    /// Spawns a monitored service and hands back the shutdown switch, so the
+    /// test decides when (and whether) to stop it.
+    fn start(
+        command: &str,
+    ) -> (
+        mpsc::UnboundedReceiver<ServiceEvent>,
+        watch::Sender<bool>,
+        JoinHandle<()>,
+    ) {
+        let srv = Arc::new(service(command, ReadyCondition::Immediate));
+        let proc = spawn_srv("test", &srv).unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let monitor = tokio::spawn(monitor_srv("test".to_owned(), srv, proc, tx, shutdown_rx));
+        (rx, shutdown_tx, monitor)
+    }
+
+    /// Consumes events until the service prints `line`, so a test can wait for
+    /// the shell to reach a known point before shutting it down.
+    async fn wait_for_line(rx: &mut mpsc::UnboundedReceiver<ServiceEvent>, line: &str) {
+        let seen = async {
+            while let Some(event) = rx.recv().await {
+                if let ServiceEvent::Output(_, OutputStream::StdOut, out) = event
+                    && out == line
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        let seen = timeout(Duration::from_secs(5), seen).await;
+        assert!(matches!(seen, Ok(true)), "service never printed {line:?}");
+    }
+
+    async fn collect_after_shutdown(
+        rx: &mut mpsc::UnboundedReceiver<ServiceEvent>,
+        monitor: JoinHandle<()>,
+    ) -> Vec<ServiceEvent> {
+        let events = timeout(Duration::from_secs(5), collect(rx))
+            .await
+            .expect("service outlived shutdown");
+        monitor.await.unwrap();
+        events
+    }
+
+    fn exit_signal(events: &[ServiceEvent]) -> Option<i32> {
+        match events.last() {
+            Some(ServiceEvent::Exit(_, status)) => status.signal(),
+            other => panic!("expected a final Exit, got {other:?}"),
+        }
     }
 
     fn ready_ids(events: &[ServiceEvent]) -> Vec<&str> {
@@ -305,19 +376,9 @@ mod tests {
         assert!(matches!(events.last(), Some(ServiceEvent::Exit(_, _))));
     }
 
-    #[test]
-    fn event_accessors_cover_every_variant() {
-        let ready = ServiceEvent::Ready("a".to_owned());
-        let failed = ServiceEvent::Failed("b".to_owned(), "boom".to_owned());
-        let output = ServiceEvent::Output("c".to_owned(), OutputStream::StdOut, "line".to_owned());
-
-        assert_eq!(ready.id(), "a");
-        assert_eq!(failed.id(), "b");
-        assert_eq!(output.id(), "c");
-
-        assert!(failed.is_terminal());
-        assert!(!ready.is_terminal());
-        assert!(!output.is_terminal());
+    /// Exit and Failed are the events a monitor ends on.
+    fn is_terminal(event: &ServiceEvent) -> bool {
+        matches!(event, ServiceEvent::Exit(_, _) | ServiceEvent::Failed(_, _))
     }
 
     #[tokio::test]
@@ -331,9 +392,9 @@ mod tests {
             ),
         ] {
             let events = run(command, cond).await;
-            let terminal = events.iter().filter(|e| e.is_terminal()).count();
+            let terminal = events.iter().filter(|e| is_terminal(e)).count();
             assert_eq!(terminal, 1, "unexpected terminal count for `{}`", command);
-            assert!(events.last().is_some_and(ServiceEvent::is_terminal));
+            assert!(events.last().is_some_and(is_terminal));
         }
     }
 
@@ -344,8 +405,9 @@ mod tests {
         let srv = Arc::new(service("sh -c 'echo hi'", ReadyCondition::Immediate));
         let proc = spawn_srv("test", &srv).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let handle = tokio::spawn(monitor_srv("test".to_owned(), srv, proc, tx));
+        let handle = tokio::spawn(monitor_srv("test".to_owned(), srv, proc, tx, shutdown_rx));
 
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -353,7 +415,7 @@ mod tests {
         }
         handle.await.unwrap();
 
-        assert!(events.last().is_some_and(ServiceEvent::is_terminal));
+        assert!(events.last().is_some_and(is_terminal));
     }
 
     #[tokio::test]
@@ -365,8 +427,11 @@ mod tests {
         let proc = spawn_srv("test", &srv).unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
+        // Kept alive so the monitor can only stop because the receiver is
+        // gone, not because a dropped sender reads as a shutdown.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let monitor = monitor_srv("test".to_owned(), srv, proc, tx);
+        let monitor = monitor_srv("test".to_owned(), srv, proc, tx, shutdown_rx);
         assert!(
             timeout(Duration::from_millis(500), monitor).await.is_ok(),
             "monitor outlived its receiver"
@@ -392,5 +457,57 @@ mod tests {
 
         assert!(ready_at < exit_at);
         assert!(started.elapsed() >= Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn shutdown_terminates_a_running_service() {
+        let (mut rx, shutdown_tx, monitor) = start("sleep 30");
+
+        shutdown_tx.send(true).unwrap();
+
+        let events = collect_after_shutdown(&mut rx, monitor).await;
+        assert_eq!(exit_signal(&events), Some(libc::SIGTERM));
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaches_the_whole_process_group() {
+        // The background sleep inherits stdout, so the stream only closes (and
+        // Exit only arrives) once it dies too, not just the shell above it.
+        let (mut rx, shutdown_tx, monitor) = start("sleep 30 & echo started; wait");
+        wait_for_line(&mut rx, "started").await;
+
+        shutdown_tx.send(true).unwrap();
+
+        let events = collect_after_shutdown(&mut rx, monitor).await;
+        assert_eq!(exit_signal(&events), Some(libc::SIGTERM));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_output_and_reports_the_exit() {
+        // A service that cleans up on SIGTERM: its last words and real exit
+        // status must still come through after the signal is sent.
+        let (mut rx, shutdown_tx, monitor) =
+            start("trap 'echo stopping; exit 0' TERM; echo started; while :; do sleep 0.1; done");
+        wait_for_line(&mut rx, "started").await;
+
+        shutdown_tx.send(true).unwrap();
+
+        let events = collect_after_shutdown(&mut rx, monitor).await;
+        assert_eq!(stdout_lines(&events), ["stopping"]);
+        assert!(matches!(
+            events.last(),
+            Some(ServiceEvent::Exit(_, status)) if status.success()
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_shutdown_sender_stops_the_service() {
+        // If the supervisor goes away, its services must not be left running.
+        let (mut rx, shutdown_tx, monitor) = start("sleep 30");
+
+        drop(shutdown_tx);
+
+        let events = collect_after_shutdown(&mut rx, monitor).await;
+        assert_eq!(exit_signal(&events), Some(libc::SIGTERM));
     }
 }

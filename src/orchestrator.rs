@@ -139,6 +139,17 @@ impl Orchestrator {
         }
     }
 
+    pub fn skip_pending(&mut self) {
+        for (_, status) in self.srv_to_status.iter_mut() {
+            match status {
+                ServiceStatus::Waiting(_) | ServiceStatus::Ready => {
+                    *status = ServiceStatus::Skipped
+                }
+                _ => continue,
+            }
+        }
+    }
+
     pub fn fulfilled(&self) -> Vec<String> {
         self.srv_to_status
             .iter()
@@ -519,5 +530,47 @@ mod tests {
 
         // `web` was released but never ran, so the run is not complete.
         assert!(!orch.all_ended_or_skipped());
+    }
+
+    // --- skip_pending ---
+
+    #[test]
+    fn skip_pending_skips_waiting_services() {
+        let mut orch = orchestrator(&[("db", &[]), ("web", &["db"]), ("worker", &["web"])]);
+        orch.mark_running("db");
+
+        orch.skip_pending();
+
+        assert!(fulfilled(&orch).is_empty());
+        // `db` is still running, so the run is not over yet.
+        assert!(!orch.all_ended_or_skipped());
+    }
+
+    #[test]
+    fn skip_pending_lets_the_run_finish_once_running_services_end() {
+        let mut orch = orchestrator(&[("db", &[]), ("web", &["db"])]);
+        orch.mark_running("db");
+        orch.mark_ready("db");
+        orch.mark_running("web");
+        orch.mark_ready("web");
+
+        orch.skip_pending();
+        assert!(!orch.all_ended_or_skipped());
+
+        orch.mark_ended("db");
+        orch.mark_ended("web");
+        assert!(orch.all_ended_or_skipped());
+    }
+
+    #[test]
+    fn skipped_services_are_not_released_by_a_late_ready() {
+        let mut orch = orchestrator(&[("db", &[]), ("web", &["db"])]);
+        orch.mark_running("db");
+
+        orch.skip_pending();
+        // `db` comes up after shutdown began: `web` must stay skipped.
+        orch.mark_ready("db");
+
+        assert!(fulfilled(&orch).is_empty());
     }
 }
