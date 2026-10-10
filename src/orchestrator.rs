@@ -140,7 +140,7 @@ impl Orchestrator {
     }
 
     pub fn skip_pending(&mut self) {
-        for (_, status) in self.srv_to_status.iter_mut() {
+        for status in self.srv_to_status.values_mut() {
             match status {
                 ServiceStatus::Waiting(_) | ServiceStatus::Ready => {
                     *status = ServiceStatus::Skipped
