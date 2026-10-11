@@ -1,6 +1,5 @@
 use std::{io::Write, sync::Arc, time::Duration};
 
-use anstyle::{AnsiColor, Style};
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender},
     watch,
@@ -16,17 +15,16 @@ use crate::{
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 pub async fn run(config: &KickstartConfig) {
+    let mut logger = Logger::stdout();
     let warns = config.validate();
-    let style = Style::new().fg_color(Some(AnsiColor::Red.into()));
     if !warns.is_empty() {
         for w in warns {
-            eprintln!("{style}[error]: {w}{style:#}");
+            logger.log("error", Level::Error, w.to_string().as_str());
         }
         return;
     }
 
     let mut orchestrator = Orchestrator::new(&config.services);
-    let mut logger = Logger::stdout();
     let mut shutting_down = false;
 
     logger.register(config.services.keys().map(String::as_str));

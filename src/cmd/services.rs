@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::{
     config::{KickstartConfig, ReadyCondition, Service},
-    log::palette::Palette,
+    log::{Level, Logger, palette::Palette},
 };
 
 const HEADER: [&str; 4] = ["STAGE", "SERVICE", "READY", "DEPENDS"];
@@ -36,10 +36,9 @@ pub fn run(config: &KickstartConfig, json: bool) {
         render_table(&mut out, &rows)
     };
 
-    let mut err = anstream::stderr();
-    let style = Style::new().fg_color(Some(AnsiColor::Yellow.into()));
+    let mut logger = Logger::stdout();
     for warning in config.validate() {
-        let _ = writeln!(err, "{style}[warning]: {warning}{style:#}");
+        let _ = logger.log("error", Level::Error, warning.to_string().as_str());
     }
 }
 

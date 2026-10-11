@@ -39,8 +39,8 @@ impl<W: Write> Logger<W> {
         logger
     }
 
-    pub fn register<'a>(&mut self, senders: impl IntoIterator<Item = &'a str>) {
-        let mut senders: Vec<_> = senders.into_iter().collect();
+    pub fn register<'a>(&mut self, labels: impl IntoIterator<Item = &'a str>) {
+        let mut senders: Vec<_> = labels.into_iter().collect();
         senders.sort_unstable();
         for sender in senders {
             self.palette.style_for(sender);
@@ -48,13 +48,13 @@ impl<W: Write> Logger<W> {
         }
     }
 
-    pub fn log(&mut self, sender: &str, level: Level, msg: &str) {
-        let (label_style, body_style) = if sender == ORCHESTRATOR {
+    pub fn log(&mut self, label: &str, level: Level, msg: &str) {
+        let (label_style, body_style) = if label == ORCHESTRATOR {
             (Style::new().dimmed(), Style::new().dimmed())
         } else {
-            (self.palette.style_for(sender), Style::new())
+            (self.palette.style_for(label), Style::new())
         };
-        self.write(sender, label_style, body_style, level, msg);
+        self.write(label, label_style, body_style, level, msg);
     }
 
     pub fn orchestrator(&mut self, level: Level, msg: &str) {
