@@ -1,12 +1,13 @@
 use std::{io::Write, sync::Arc, time::Duration};
 
+use anstyle::{AnsiColor, Style};
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender},
     watch,
 };
 
 use crate::{
-    config::IgniteConfig,
+    config::KickstartConfig,
     exec::{self, OutputStream, ServiceEvent, monitor_srv},
     log::{Level, Logger},
     orchestrator::{EndOutcome, Orchestrator},
@@ -14,7 +15,16 @@ use crate::{
 
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
-pub async fn run(config: &IgniteConfig) {
+pub async fn run(config: &KickstartConfig) {
+    let warns = config.validate();
+    let style = Style::new().fg_color(Some(AnsiColor::Red.into()));
+    if !warns.is_empty() {
+        for w in warns {
+            eprintln!("{style}[error]: {w}{style:#}");
+        }
+        return;
+    }
+
     let mut orchestrator = Orchestrator::new(&config.services);
     let mut logger = Logger::stdout();
     let mut shutting_down = false;
@@ -119,7 +129,7 @@ fn log_skipped<W: Write>(logger: &mut Logger<W>, srv: &str, skipped: Vec<String>
 
 fn spawn_fulfilled<W: Write>(
     orchestrator: &mut Orchestrator,
-    config: &IgniteConfig,
+    config: &KickstartConfig,
     logger: &mut Logger<W>,
     tx: UnboundedSender<ServiceEvent>,
     shutdown_rx: watch::Receiver<bool>,

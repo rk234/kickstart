@@ -16,5 +16,9 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     Up,
-    Services,
+    Services {
+        /// Print services as JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
 }

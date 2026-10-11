@@ -1,4 +1,4 @@
-mod palette;
+pub mod palette;
 mod sanitize;
 
 use std::io::Write;

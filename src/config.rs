@@ -1,4 +1,7 @@
-use std::{collections::HashMap, fmt::Display};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,8 +24,100 @@ pub struct Service {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct IgniteConfig {
+pub struct KickstartConfig {
     pub services: HashMap<String, Service>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConfigWarning {
+    UndefinedDependency { service: String, dependency: String },
+    Cycle(Vec<String>),
+}
+
+impl Display for ConfigWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UndefinedDependency {
+                service,
+                dependency,
+            } => write!(
+                f,
+                "{service} depends on \"{dependency}\", which isn't defined"
+            ),
+            Self::Cycle(services) => write!(
+                f,
+                "dependency cycle {} → {}: these services will never start",
+                services.join(" → "),
+                services[0]
+            ),
+        }
+    }
+}
+
+impl KickstartConfig {
+    pub fn validate(&self) -> Vec<ConfigWarning> {
+        let mut warnings = self.undefined_dependencies();
+        warnings.extend(self.cycles());
+        warnings
+    }
+
+    fn sorted_ids(&self) -> Vec<&str> {
+        let mut ids: Vec<_> = self.services.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn undefined_dependencies(&self) -> Vec<ConfigWarning> {
+        let mut warnings = Vec::new();
+        for id in self.sorted_ids() {
+            let mut seen = HashSet::new();
+            for dep in &self.services[id].depends_on {
+                if !self.services.contains_key(dep) && seen.insert(dep) {
+                    warnings.push(ConfigWarning::UndefinedDependency {
+                        service: id.to_owned(),
+                        dependency: dep.clone(),
+                    });
+                }
+            }
+        }
+        warnings
+    }
+
+    fn cycles(&self) -> Vec<ConfigWarning> {
+        let mut visited = HashSet::new();
+        let mut cycles = Vec::new();
+        for id in self.sorted_ids() {
+            self.find_cycles(id, &mut Vec::new(), &mut visited, &mut cycles);
+        }
+        cycles
+    }
+
+    fn find_cycles<'a>(
+        &'a self,
+        id: &'a str,
+        path: &mut Vec<&'a str>,
+        visited: &mut HashSet<&'a str>,
+        cycles: &mut Vec<ConfigWarning>,
+    ) {
+        if let Some(start) = path.iter().position(|&srv| srv == id) {
+            let cycle = path[start..].iter().map(|&srv| srv.to_owned()).collect();
+            cycles.push(ConfigWarning::Cycle(cycle));
+            return;
+        }
+        if !visited.insert(id) {
+            return;
+        }
+        // Undefined services are reported by `undefined_dependencies`.
+        let Some(srv) = self.services.get(id) else {
+            return;
+        };
+
+        path.push(id);
+        for dep in &srv.depends_on {
+            self.find_cycles(dep, path, visited, cycles);
+        }
+        path.pop();
+    }
 }
 
 #[derive(Debug)]
@@ -60,12 +155,12 @@ pub fn read_config(path: Option<&str>) -> Result<String, std::io::Error> {
     std::fs::read_to_string(path.unwrap_or(DEFAULT_CONFIG_PATH))
 }
 
-pub fn parse_config(cfg: &str) -> Result<IgniteConfig, toml::de::Error> {
+pub fn parse_config(cfg: &str) -> Result<KickstartConfig, toml::de::Error> {
     let config = toml::from_str(cfg)?;
     Ok(config)
 }
 
-pub fn load_config(cfg: Option<&str>) -> Result<IgniteConfig, LoadError> {
+pub fn load_config(cfg: Option<&str>) -> Result<KickstartConfig, LoadError> {
     let content = read_config(cfg)?;
     let cfg = parse_config(content.as_str())?;
     Ok(cfg)
@@ -221,5 +316,91 @@ mod tests {
         let toml_err = parse_config("bad [[[").unwrap_err();
         let load_err = LoadError::from(toml_err);
         assert!(load_err.to_string().contains("failed to parse config file"));
+    }
+
+    fn graph(defs: &[(&str, &[&str])]) -> KickstartConfig {
+        let services = defs
+            .iter()
+            .map(|(id, deps)| {
+                let srv = Service {
+                    name: None,
+                    command: "true".to_owned(),
+                    ready_condition: ReadyCondition::Immediate,
+                    depends_on: deps.iter().map(|d| d.to_string()).collect(),
+                };
+                (id.to_string(), srv)
+            })
+            .collect();
+        KickstartConfig { services }
+    }
+
+    fn cycle(services: &[&str]) -> ConfigWarning {
+        ConfigWarning::Cycle(services.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn undefined(service: &str, dependency: &str) -> ConfigWarning {
+        ConfigWarning::UndefinedDependency {
+            service: service.to_owned(),
+            dependency: dependency.to_owned(),
+        }
+    }
+
+    #[test]
+    fn valid_graph_has_no_warnings() {
+        let cfg = graph(&[("db", &[]), ("api", &["db"]), ("web", &["api", "db"])]);
+        assert!(cfg.validate().is_empty());
+    }
+
+    #[test]
+    fn reports_undefined_dependencies_once_per_service() {
+        let cfg = graph(&[("api", &["dbb", "dbb"]), ("web", &["dbb", "api"])]);
+        assert_eq!(
+            cfg.validate(),
+            [undefined("api", "dbb"), undefined("web", "dbb")]
+        );
+    }
+
+    #[test]
+    fn reports_a_two_service_cycle_once() {
+        let cfg = graph(&[("a", &["b"]), ("b", &["a"]), ("c", &["a"])]);
+        assert_eq!(cfg.validate(), [cycle(&["a", "b"])]);
+    }
+
+    #[test]
+    fn reports_self_dependency_as_a_cycle() {
+        let cfg = graph(&[("a", &["a"])]);
+        assert_eq!(cfg.validate(), [cycle(&["a"])]);
+    }
+
+    #[test]
+    fn reports_only_the_services_in_the_cycle() {
+        let cfg = graph(&[
+            ("entry", &["x"]),
+            ("x", &["y"]),
+            ("y", &["z"]),
+            ("z", &["x"]),
+        ]);
+        assert_eq!(cfg.validate(), [cycle(&["x", "y", "z"])]);
+    }
+
+    #[test]
+    fn reports_undefined_dependencies_before_cycles() {
+        let cfg = graph(&[("a", &["b"]), ("b", &["a"]), ("c", &["ghost"])]);
+        assert_eq!(
+            cfg.validate(),
+            [undefined("c", "ghost"), cycle(&["a", "b"])]
+        );
+    }
+
+    #[test]
+    fn warning_messages() {
+        assert_eq!(
+            undefined("api", "dbb").to_string(),
+            "api depends on \"dbb\", which isn't defined"
+        );
+        assert_eq!(
+            cycle(&["a", "b"]).to_string(),
+            "dependency cycle a → b → a: these services will never start"
+        );
     }
 }

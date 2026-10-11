@@ -5,17 +5,13 @@ mod exec;
 mod log;
 mod orchestrator;
 
-use crate::{cli::Cli, config::IgniteConfig};
+use crate::{cli::Cli, config::KickstartConfig};
 use clap::Parser;
 
-async fn dispatch(cli: &Cli, config: &IgniteConfig) {
+async fn dispatch(cli: &Cli, config: &KickstartConfig) {
     match cli.command {
         cli::Commands::Up => cmd::up::run(config).await,
-        cli::Commands::Services => {
-            for name in config.services.keys() {
-                println!("{}", name);
-            }
-        }
+        cli::Commands::Services { json } => cmd::services::run(config, json),
     }
 }
 
