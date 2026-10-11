@@ -12,7 +12,7 @@ use tokio::{
     net::TcpStream,
     process::{Child, Command},
     sync::{mpsc::UnboundedSender, watch},
-    time::{sleep, timeout},
+    time::{Instant, sleep, timeout},
 };
 
 use crate::config::{ReadyCondition, Service};
@@ -103,18 +103,25 @@ where
     }
 }
 
+fn signal_group(gpid: i32, sig: i32) {
+    unsafe { libc::killpg(gpid, sig) };
+}
+
 pub async fn monitor_srv(
     id: String,
     srv: Arc<Service>,
     mut proc: Child,
     tx: UnboundedSender<ServiceEvent>,
     mut shutdown: watch::Receiver<bool>,
+    shutdown_grace_period: Duration,
 ) {
     let mut stdout = proc.stdout.take().map(|out| BufReader::new(out).lines());
     let mut stderr = proc.stderr.take().map(|err| BufReader::new(err).lines());
 
     let ready = await_ready(&srv.ready_condition);
+    let shutdown_timer = tokio::time::sleep(shutdown_grace_period);
     tokio::pin!(ready);
+    tokio::pin!(shutdown_timer);
 
     let pgid = proc.id();
     let mut is_ready = false;
@@ -165,9 +172,14 @@ pub async fn monitor_srv(
             _ = shutdown.wait_for(|&stop| stop), if !signalled && status.is_none() => {
                 signalled = true;
                 if let Some(pgid) = pgid {
-                    unsafe {
-                        libc::killpg(pgid as i32, libc::SIGTERM);
-                    }
+                    signal_group(pgid as i32, libc::SIGTERM);
+                    shutdown_timer.as_mut().reset(Instant::now() + shutdown_grace_period);
+                }
+                continue;
+            },
+            () = &mut shutdown_timer, if signalled => {
+                if let Some(pgid) = pgid {
+                    signal_group(pgid as i32, libc::SIGKILL);
                 }
                 continue;
             },
@@ -189,6 +201,10 @@ mod tests {
     use std::{net::TcpListener, os::unix::process::ExitStatusExt, time::Instant};
     use tokio::{sync::mpsc, task::JoinHandle};
 
+    /// Long enough that a service which stops on SIGTERM is never escalated to
+    /// SIGKILL, so only tests that ask for a short grace period see one.
+    const GRACE: Duration = Duration::from_secs(5);
+
     fn service(command: &str, ready_condition: ReadyCondition) -> Service {
         Service {
             name: None,
@@ -205,7 +221,7 @@ mod tests {
         // Held for the whole run: dropping the sender counts as a shutdown.
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        monitor_srv("test".to_owned(), srv, proc, tx, shutdown_rx).await;
+        monitor_srv("test".to_owned(), srv, proc, tx, shutdown_rx, GRACE).await;
 
         collect(&mut rx).await
     }
@@ -229,11 +245,29 @@ mod tests {
         watch::Sender<bool>,
         JoinHandle<()>,
     ) {
+        start_with_grace(command, GRACE)
+    }
+
+    fn start_with_grace(
+        command: &str,
+        grace: Duration,
+    ) -> (
+        mpsc::UnboundedReceiver<ServiceEvent>,
+        watch::Sender<bool>,
+        JoinHandle<()>,
+    ) {
         let srv = Arc::new(service(command, ReadyCondition::Immediate));
         let proc = spawn_srv("test", &srv).unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let monitor = tokio::spawn(monitor_srv("test".to_owned(), srv, proc, tx, shutdown_rx));
+        let monitor = tokio::spawn(monitor_srv(
+            "test".to_owned(),
+            srv,
+            proc,
+            tx,
+            shutdown_rx,
+            grace,
+        ));
         (rx, shutdown_tx, monitor)
     }
 
@@ -407,7 +441,14 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let handle = tokio::spawn(monitor_srv("test".to_owned(), srv, proc, tx, shutdown_rx));
+        let handle = tokio::spawn(monitor_srv(
+            "test".to_owned(),
+            srv,
+            proc,
+            tx,
+            shutdown_rx,
+            GRACE,
+        ));
 
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -431,7 +472,7 @@ mod tests {
         // gone, not because a dropped sender reads as a shutdown.
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let monitor = monitor_srv("test".to_owned(), srv, proc, tx, shutdown_rx);
+        let monitor = monitor_srv("test".to_owned(), srv, proc, tx, shutdown_rx, GRACE);
         assert!(
             timeout(Duration::from_millis(500), monitor).await.is_ok(),
             "monitor outlived its receiver"
@@ -506,6 +547,67 @@ mod tests {
         let (mut rx, shutdown_tx, monitor) = start("sleep 30");
 
         drop(shutdown_tx);
+
+        let events = collect_after_shutdown(&mut rx, monitor).await;
+        assert_eq!(exit_signal(&events), Some(libc::SIGTERM));
+    }
+
+    /// Ignores SIGTERM: `trap ''` is inherited across exec, so the loop's
+    /// `sleep` children ignore it too and the whole group shrugs it off.
+    const IGNORES_SIGTERM: &str = "trap '' TERM; echo started; while :; do sleep 0.1; done";
+
+    #[tokio::test]
+    async fn sigterm_is_escalated_to_sigkill_after_the_grace_period() {
+        let grace = Duration::from_millis(300);
+        let (mut rx, shutdown_tx, monitor) = start_with_grace(IGNORES_SIGTERM, grace);
+        wait_for_line(&mut rx, "started").await;
+
+        let signalled_at = Instant::now();
+        shutdown_tx.send(true).unwrap();
+
+        let events = collect_after_shutdown(&mut rx, monitor).await;
+        assert_eq!(exit_signal(&events), Some(libc::SIGKILL));
+        assert!(
+            signalled_at.elapsed() >= grace,
+            "SIGKILL arrived before the grace period ran out"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_grace_period_starts_at_shutdown_not_at_spawn() {
+        // The timer is created when the monitor starts. If shutdown didn't
+        // reset it, a service stopped after its grace period had already
+        // passed would be killed at once instead of getting the full grace.
+        let grace = Duration::from_millis(300);
+        let (mut rx, shutdown_tx, monitor) = start_with_grace(IGNORES_SIGTERM, grace);
+        wait_for_line(&mut rx, "started").await;
+        sleep(grace * 2).await;
+
+        let signalled_at = Instant::now();
+        shutdown_tx.send(true).unwrap();
+
+        let events = collect_after_shutdown(&mut rx, monitor).await;
+        assert_eq!(exit_signal(&events), Some(libc::SIGKILL));
+        assert!(
+            signalled_at.elapsed() >= grace,
+            "SIGKILL arrived before the grace period ran out"
+        );
+    }
+
+    #[tokio::test]
+    async fn sigkill_reaches_children_that_outlive_the_shell() {
+        // The shell itself dies on SIGTERM, but its background child ignores
+        // it and keeps stdout open. Escalation has to reach the group even
+        // though the shell has already been reaped. The child announces
+        // itself only once its trap is set, so SIGTERM can't beat it.
+        let grace = Duration::from_millis(300);
+        let (mut rx, shutdown_tx, monitor) = start_with_grace(
+            "(trap '' TERM; echo started; while :; do sleep 0.1; done) & wait",
+            grace,
+        );
+        wait_for_line(&mut rx, "started").await;
+
+        shutdown_tx.send(true).unwrap();
 
         let events = collect_after_shutdown(&mut rx, monitor).await;
         assert_eq!(exit_signal(&events), Some(libc::SIGTERM));

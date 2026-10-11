@@ -1,4 +1,4 @@
-use std::{io::Write, sync::Arc};
+use std::{io::Write, sync::Arc, time::Duration};
 
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender},
@@ -11,6 +11,8 @@ use crate::{
     log::{Level, Logger},
     orchestrator::{EndOutcome, Orchestrator},
 };
+
+const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 pub async fn run(config: &IgniteConfig) {
     let mut orchestrator = Orchestrator::new(&config.services);
@@ -138,7 +140,7 @@ fn spawn_fulfilled<W: Write>(
                 let tx = tx.clone();
                 let shutdown_rx = shutdown_rx.clone();
                 tokio::spawn(async move {
-                    monitor_srv(srv, service, child, tx, shutdown_rx).await;
+                    monitor_srv(srv, service, child, tx, shutdown_rx, SHUTDOWN_GRACE_PERIOD).await;
                 });
             }
             Err(e) => {
