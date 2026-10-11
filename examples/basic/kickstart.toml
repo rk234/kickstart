@@ -1,0 +1,16 @@
+# Run from this directory: cargo run -- up
+[services]
+
+[services.backend]
+command = "python3 -u backend.py"
+ready_condition = { port = 8000 }
+
+[services.seed]
+command = "python3 -u seed.py"
+depends_on = ["backend"]
+ready_condition = { exitcode = 0 }
+
+[services.frontend]
+command = "python3 -u frontend.py"
+depends_on = ["backend"]
+ready_condition = { port = 3000 }

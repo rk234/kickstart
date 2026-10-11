@@ -48,7 +48,7 @@ pub async fn run(config: &IgniteConfig) {
                 match shutdown_tx.send(true) {
                     Ok(_) => {
                         orchestrator.skip_pending();
-                        logger.orchestrator(Level::Notice, "sutting down");
+                        logger.orchestrator(Level::Notice, "shutting down");
                     },
                     Err(_) => {
                         logger.orchestrator(Level::Error, "failed to send shutdown signal!");
