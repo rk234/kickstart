@@ -1,12 +1,16 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-// Configure the top-level command metadata
 #[command(name = "kickstart")]
 #[command(version = "0.1.0")]
-#[command(about = "Kickstarts your local development environments", long_about = None)]
+#[command(
+    about = "Orchestrate your development environments",
+    long_about = "Kickstart spins up your local development services in dependency order, launching each one once its dependencies are ready."
+)]
 pub struct Cli {
-    #[arg(short, long)]
+    /// Optional configuration file path.
+    /// Default: kickstart.toml
+    #[arg(short, long, global = true)]
     pub config: Option<String>,
 
     #[command(subcommand)]
@@ -15,7 +19,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Starts services
     Up,
+    /// List configured services, dependencies, and ready conditions
     Services {
         /// Print services as JSON instead of a table
         #[arg(long)]
