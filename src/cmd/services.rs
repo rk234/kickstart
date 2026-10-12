@@ -38,7 +38,7 @@ pub fn run(config: &KickstartConfig, json: bool) {
 
     let mut logger = Logger::stdout();
     for warning in config.validate() {
-        let _ = logger.log("error", Level::Error, warning.to_string().as_str());
+        logger.log("error", Level::Error, warning.to_string().as_str());
     }
 }
 
