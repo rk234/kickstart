@@ -4,6 +4,7 @@ mod config;
 mod exec;
 mod log;
 mod orchestrator;
+mod registry;
 
 use crate::{cli::Cli, config::KickstartConfig};
 use clap::Parser;

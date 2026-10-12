@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
-use crate::config::Service;
+use crate::registry::{Registry, ServiceId};
 
 enum ServiceStatus {
-    Waiting(HashSet<String>),
+    Waiting(HashSet<ServiceId>),
     Ready,
     Running,
     /// Running and its ready condition has fired.
@@ -14,55 +14,45 @@ enum ServiceStatus {
 
 pub enum EndOutcome {
     Ended,
-    Failed { skipped: Vec<String> },
+    Failed { skipped: Vec<ServiceId> },
 }
 
+/// Per-service state, indexed by `ServiceId`.
 pub struct Orchestrator {
-    srv_to_status: HashMap<String, ServiceStatus>,
-    srv_to_dependents: HashMap<String, Vec<String>>,
+    status: Vec<ServiceStatus>,
+    dependents: Vec<Vec<ServiceId>>,
 }
 
 impl Orchestrator {
-    pub fn new(services: &HashMap<String, Service>) -> Self {
-        let mut srv_to_status = HashMap::new();
-        let mut srv_to_dependents: HashMap<String, Vec<String>> = HashMap::new();
+    pub fn new(registry: &Registry) -> Self {
+        let mut status = Vec::with_capacity(registry.len());
+        let mut dependents = vec![Vec::new(); registry.len()];
 
-        for (id, srv) in services {
-            let deps = &srv.depends_on;
+        for id in registry.ids() {
+            let deps = registry.deps(id);
 
             // populate status
-            let status = if deps.is_empty() {
+            status.push(if deps.is_empty() {
                 ServiceStatus::Ready
             } else {
-                ServiceStatus::Waiting(deps.iter().cloned().collect())
-            };
-            srv_to_status.insert(id.clone(), status);
+                ServiceStatus::Waiting(deps.iter().copied().collect())
+            });
 
             // populate dependents (reverse edge: dependency -> services waiting on it)
             for dep in deps {
-                srv_to_dependents
-                    .entry(dep.clone())
-                    .or_default()
-                    .push(id.clone());
+                dependents[dep.index()].push(id);
             }
         }
 
-        Orchestrator {
-            srv_to_status,
-            srv_to_dependents,
-        }
+        Orchestrator { status, dependents }
     }
 
-    pub fn mark_running(&mut self, srv: &str) {
-        if let Some(status) = self.srv_to_status.get_mut(srv) {
-            *status = ServiceStatus::Running;
-        }
+    pub fn mark_running(&mut self, srv: ServiceId) {
+        self.status[srv.index()] = ServiceStatus::Running;
     }
 
-    pub fn mark_ended(&mut self, srv: &str) -> EndOutcome {
-        let Some(status) = self.srv_to_status.get_mut(srv) else {
-            return EndOutcome::Ended;
-        };
+    pub fn mark_ended(&mut self, srv: ServiceId) -> EndOutcome {
+        let status = &mut self.status[srv.index()];
         match status {
             ServiceStatus::Up | ServiceStatus::Ended | ServiceStatus::Skipped => {
                 *status = ServiceStatus::Ended;
@@ -76,38 +66,25 @@ impl Orchestrator {
         }
     }
 
-    pub fn mark_failed(&mut self, srv: &str) -> Vec<String> {
-        if let Some(status) = self.srv_to_status.get_mut(srv) {
-            *status = ServiceStatus::Ended;
-        }
+    pub fn mark_failed(&mut self, srv: ServiceId) -> Vec<ServiceId> {
+        self.status[srv.index()] = ServiceStatus::Ended;
 
         let mut skipped = Vec::new();
-        let mut q = VecDeque::new();
-        let Some(dependents) = self.srv_to_dependents.get(srv) else {
-            return skipped;
-        };
-
-        q.extend(dependents.clone());
+        let mut q: VecDeque<_> = self.dependents[srv.index()].iter().copied().collect();
 
         while let Some(srv) = q.pop_front() {
-            if !self.mark_skipped(&srv) {
+            if !self.mark_skipped(srv) {
                 continue;
             }
-            skipped.push(srv.clone());
-
-            let Some(dependents) = self.srv_to_dependents.get(&srv) else {
-                continue;
-            };
-            q.extend(dependents.clone());
+            skipped.push(srv);
+            q.extend(self.dependents[srv.index()].iter().copied());
         }
 
         skipped
     }
 
-    fn mark_skipped(&mut self, srv: &str) -> bool {
-        let Some(status) = self.srv_to_status.get_mut(srv) else {
-            return false;
-        };
+    fn mark_skipped(&mut self, srv: ServiceId) -> bool {
+        let status = &mut self.status[srv.index()];
         if !matches!(status, ServiceStatus::Waiting(_) | ServiceStatus::Ready) {
             return false;
         }
@@ -115,23 +92,16 @@ impl Orchestrator {
         true
     }
 
-    pub fn mark_ready(&mut self, srv: &str) {
-        if let Some(status) = self.srv_to_status.get_mut(srv)
-            && matches!(status, ServiceStatus::Running)
-        {
+    pub fn mark_ready(&mut self, srv: ServiceId) {
+        let status = &mut self.status[srv.index()];
+        if matches!(status, ServiceStatus::Running) {
             *status = ServiceStatus::Up;
         }
 
-        let Some(dependents) = self.srv_to_dependents.get(srv) else {
-            return;
-        };
-
-        for dependent in dependents {
-            let Some(status) = self.srv_to_status.get_mut(dependent) else {
-                continue;
-            };
+        for dependent in &self.dependents[srv.index()] {
+            let status = &mut self.status[dependent.index()];
             if let ServiceStatus::Waiting(dependencies) = status {
-                dependencies.remove(srv);
+                dependencies.remove(&srv);
                 if dependencies.is_empty() {
                     *status = ServiceStatus::Ready
                 }
@@ -140,7 +110,7 @@ impl Orchestrator {
     }
 
     pub fn skip_pending(&mut self) {
-        for status in self.srv_to_status.values_mut() {
+        for status in &mut self.status {
             match status {
                 ServiceStatus::Waiting(_) | ServiceStatus::Ready => {
                     *status = ServiceStatus::Skipped
@@ -150,17 +120,17 @@ impl Orchestrator {
         }
     }
 
-    pub fn fulfilled(&self) -> Vec<String> {
-        self.srv_to_status
+    pub fn fulfilled(&self) -> Vec<ServiceId> {
+        self.status
             .iter()
+            .enumerate()
             .filter(|(_, s)| matches!(s, ServiceStatus::Ready))
-            .map(|(s, _)| s)
-            .cloned()
+            .map(|(i, _)| ServiceId::new(i))
             .collect()
     }
 
     pub fn all_ended_or_skipped(&self) -> bool {
-        self.srv_to_status.values().all(|status| {
+        self.status.iter().all(|status| {
             matches!(status, ServiceStatus::Ended) || matches!(status, ServiceStatus::Skipped)
         })
     }
@@ -169,7 +139,7 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ReadyCondition;
+    use crate::config::{KickstartConfig, ReadyCondition, Service};
 
     fn service(depends_on: &[&str]) -> Service {
         Service {
@@ -180,22 +150,71 @@ mod tests {
         }
     }
 
-    fn orchestrator(services: &[(&str, &[&str])]) -> Orchestrator {
+    /// Wraps an `Orchestrator` so tests can address services by name.
+    struct Harness {
+        orch: Orchestrator,
+        registry: Registry<'static>,
+    }
+
+    impl Harness {
+        fn id(&self, srv: &str) -> ServiceId {
+            self.registry.lookup(srv).expect("unknown service")
+        }
+
+        fn names(&self, ids: Vec<ServiceId>) -> Vec<&'static str> {
+            let mut names: Vec<_> = ids.into_iter().map(|id| self.registry.id(id)).collect();
+            names.sort();
+            names
+        }
+
+        fn mark_running(&mut self, srv: &str) {
+            self.orch.mark_running(self.id(srv));
+        }
+
+        fn mark_ready(&mut self, srv: &str) {
+            self.orch.mark_ready(self.id(srv));
+        }
+
+        fn mark_ended(&mut self, srv: &str) -> EndOutcome {
+            self.orch.mark_ended(self.id(srv))
+        }
+
+        fn mark_failed(&mut self, srv: &str) -> Vec<ServiceId> {
+            self.orch.mark_failed(self.id(srv))
+        }
+
+        fn skip_pending(&mut self) {
+            self.orch.skip_pending();
+        }
+
+        fn fulfilled(&self) -> Vec<&'static str> {
+            self.names(self.orch.fulfilled())
+        }
+
+        fn all_ended_or_skipped(&self) -> bool {
+            self.orch.all_ended_or_skipped()
+        }
+    }
+
+    fn orchestrator(services: &[(&str, &[&str])]) -> Harness {
         let services = services
             .iter()
             .map(|(id, deps)| ((*id).to_owned(), service(deps)))
             .collect();
-        Orchestrator::new(&services)
+        let config = Box::leak(Box::new(KickstartConfig { services }));
+        let registry = Registry::new(config);
+        Harness {
+            orch: Orchestrator::new(&registry),
+            registry,
+        }
     }
 
-    fn fulfilled(orch: &Orchestrator) -> Vec<String> {
-        let mut ids = orch.fulfilled();
-        ids.sort();
-        ids
+    fn fulfilled(orch: &Harness) -> Vec<&'static str> {
+        orch.fulfilled()
     }
 
     /// Drives a service through the full lifecycle: spawned, ready, exited.
-    fn run_to_completion(orch: &mut Orchestrator, srv: &str) {
+    fn run_to_completion(orch: &mut Harness, srv: &str) {
         orch.mark_running(srv);
         orch.mark_ready(srv);
         orch.mark_ended(srv);
@@ -302,33 +321,11 @@ mod tests {
     }
 
     #[test]
-    fn marking_an_unknown_service_ready_is_a_no_op() {
-        let mut orch = orchestrator(&[("db", &[]), ("web", &["db"])]);
-        orch.mark_ready("nope");
-        assert_eq!(fulfilled(&orch), vec!["db"]);
-    }
-
-    #[test]
     fn marking_ready_does_not_change_the_services_own_status() {
         // `db` was never spawned, so it stays Ready and is still handed out.
         let mut orch = orchestrator(&[("db", &[]), ("web", &["db"])]);
         orch.mark_ready("db");
         assert_eq!(fulfilled(&orch), vec!["db", "web"]);
-    }
-
-    #[test]
-    fn dependency_on_an_undeclared_service_never_resolves() {
-        let orch = orchestrator(&[("web", &["ghost"])]);
-        assert!(orch.fulfilled().is_empty());
-    }
-
-    #[test]
-    fn undeclared_dependency_can_still_be_marked_ready() {
-        // `ghost` is never registered as a service, but the reverse edge exists,
-        // so marking it ready still releases anything waiting on it.
-        let mut orch = orchestrator(&[("web", &["ghost"])]);
-        orch.mark_ready("ghost");
-        assert_eq!(fulfilled(&orch), vec!["web"]);
     }
 
     #[test]
@@ -352,13 +349,6 @@ mod tests {
         let mut orch = orchestrator(&[("db", &[]), ("web", &["db"])]);
         orch.mark_running("db");
         assert!(orch.fulfilled().is_empty());
-    }
-
-    #[test]
-    fn marking_running_on_an_unknown_service_is_a_no_op() {
-        let mut orch = orchestrator(&[("db", &[])]);
-        orch.mark_running("nope");
-        assert_eq!(fulfilled(&orch), vec!["db"]);
     }
 
     // --- mark_ended ---
@@ -388,11 +378,10 @@ mod tests {
         let mut orch = orchestrator(&[("db", &[]), ("web", &["db"]), ("app", &["web"])]);
         orch.mark_running("db");
 
-        let EndOutcome::Failed { mut skipped } = orch.mark_ended("db") else {
+        let EndOutcome::Failed { skipped } = orch.mark_ended("db") else {
             panic!("db ended before ready but was not failed");
         };
-        skipped.sort();
-        assert_eq!(skipped, ["app", "web"]);
+        assert_eq!(orch.names(skipped), ["app", "web"]);
         assert!(orch.fulfilled().is_empty());
         assert!(orch.all_ended_or_skipped());
     }
@@ -415,14 +404,6 @@ mod tests {
             orch.mark_ended("db"),
             EndOutcome::Failed { skipped } if skipped.is_empty()
         ));
-    }
-
-    #[test]
-    fn marking_ended_on_an_unknown_service_is_a_no_op() {
-        let mut orch = orchestrator(&[("db", &[])]);
-        orch.mark_ended("nope");
-        assert_eq!(fulfilled(&orch), vec!["db"]);
-        assert!(!orch.all_ended_or_skipped());
     }
 
     #[test]
@@ -520,16 +501,6 @@ mod tests {
 
         run_to_completion(&mut orch, "c");
         assert!(orch.all_ended_or_skipped());
-    }
-
-    #[test]
-    fn all_ended_stays_false_when_a_dependent_can_never_run() {
-        let mut orch = orchestrator(&[("web", &["ghost"])]);
-
-        orch.mark_ready("ghost");
-
-        // `web` was released but never ran, so the run is not complete.
-        assert!(!orch.all_ended_or_skipped());
     }
 
     // --- skip_pending ---

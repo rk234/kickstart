@@ -1,4 +1,4 @@
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{io::Write, time::Duration};
 
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender},
@@ -10,6 +10,7 @@ use crate::{
     exec::{self, OutputStream, ServiceEvent, monitor_srv},
     log::{Level, Logger},
     orchestrator::{EndOutcome, Orchestrator},
+    registry::{Registry, ServiceId},
 };
 
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
@@ -24,7 +25,8 @@ pub async fn run(config: &KickstartConfig) {
         return;
     }
 
-    let mut orchestrator = Orchestrator::new(&config.services);
+    let registry = Registry::new(config);
+    let mut orchestrator = Orchestrator::new(&registry);
     let mut shutting_down = false;
 
     logger.register(config.services.keys().map(String::as_str));
@@ -39,7 +41,7 @@ pub async fn run(config: &KickstartConfig) {
     let mut spawned = Vec::new();
     spawned.extend(spawn_fulfilled(
         &mut orchestrator,
-        config,
+        &registry,
         &mut logger,
         event_tx.clone(),
         shutdown_rx.clone(),
@@ -67,43 +69,48 @@ pub async fn run(config: &KickstartConfig) {
         };
 
         match msg {
-            ServiceEvent::Exit(key, status) => match orchestrator.mark_ended(&key) {
-                EndOutcome::Failed { skipped } => {
-                    logger.orchestrator(
-                        Level::Error,
-                        &format!("{key} exited with {status} before becoming ready"),
-                    );
-                    log_skipped(&mut logger, &key, skipped);
+            ServiceEvent::Exit(id, status) => {
+                let key = registry.id(id);
+                match orchestrator.mark_ended(id) {
+                    EndOutcome::Failed { skipped } => {
+                        logger.orchestrator(
+                            Level::Error,
+                            &format!("{key} exited with {status} before becoming ready"),
+                        );
+                        log_skipped(&mut logger, &registry, key, skipped);
+                    }
+                    EndOutcome::Ended if status.success() => {
+                        logger.orchestrator(Level::Info, &format!("{key} exited"));
+                    }
+                    EndOutcome::Ended => {
+                        logger.orchestrator(Level::Error, &format!("{key} exited with {status}"));
+                    }
                 }
-                EndOutcome::Ended if status.success() => {
-                    logger.orchestrator(Level::Info, &format!("{key} exited"));
-                }
-                EndOutcome::Ended => {
-                    logger.orchestrator(Level::Error, &format!("{key} exited with {status}"));
-                }
-            },
-            ServiceEvent::Ready(key) => {
+            }
+            ServiceEvent::Ready(id) => {
+                let key = registry.id(id);
                 logger.orchestrator(Level::Info, &format!("{key} is ready"));
-                orchestrator.mark_ready(&key);
+                orchestrator.mark_ready(id);
             }
-            ServiceEvent::Failed(key, err) => {
+            ServiceEvent::Failed(id, err) => {
+                let key = registry.id(id);
                 logger.orchestrator(Level::Error, &format!("{key} failed: {err}"));
-                let skipped = orchestrator.mark_failed(&key);
-                log_skipped(&mut logger, &key, skipped);
+                let skipped = orchestrator.mark_failed(id);
+                log_skipped(&mut logger, &registry, key, skipped);
             }
-            ServiceEvent::Output(key, stream, line) => {
+            ServiceEvent::Output(id, stream, line) => {
                 let level = match stream {
                     OutputStream::StdOut => Level::Info,
                     OutputStream::StdErr => Level::Notice,
                 };
-                logger.log(&key, level, &line);
+                logger.log(registry.id(id), level, &line);
             }
         }
 
         if !shutting_down {
             spawned.extend(spawn_fulfilled(
                 &mut orchestrator,
-                config,
+                &registry,
                 &mut logger,
                 event_tx.clone(),
                 shutdown_rx.clone(),
@@ -116,8 +123,14 @@ pub async fn run(config: &KickstartConfig) {
     }
 }
 
-fn log_skipped<W: Write>(logger: &mut Logger<W>, srv: &str, skipped: Vec<String>) {
+fn log_skipped<W: Write>(
+    logger: &mut Logger<W>,
+    registry: &Registry,
+    srv: &str,
+    skipped: Vec<ServiceId>,
+) {
     for skipped in skipped {
+        let skipped = registry.id(skipped);
         logger.orchestrator(
             Level::Notice,
             &format!("skipping {skipped}: dependency {srv} failed"),
@@ -127,29 +140,33 @@ fn log_skipped<W: Write>(logger: &mut Logger<W>, srv: &str, skipped: Vec<String>
 
 fn spawn_fulfilled<W: Write>(
     orchestrator: &mut Orchestrator,
-    config: &KickstartConfig,
+    registry: &Registry,
     logger: &mut Logger<W>,
     tx: UnboundedSender<ServiceEvent>,
     shutdown_rx: watch::Receiver<bool>,
-) -> Vec<(String, u32)> {
+) -> Vec<(ServiceId, u32)> {
     let mut spawned = Vec::new();
-    for srv in orchestrator.fulfilled() {
-        let service = Arc::new(config.services[&srv].clone());
-        let name = service.name.clone().unwrap_or(srv.clone());
-        match exec::spawn_srv(&srv, &service) {
+    for id in orchestrator.fulfilled() {
+        let srv = registry.id(id);
+        let service = registry.service(id);
+        let name = service.name.as_deref().unwrap_or(srv);
+        match exec::spawn_srv(service) {
             Ok(child) => {
                 logger.orchestrator(Level::Info, &format!("spawned {name} [{srv}]"));
 
-                orchestrator.mark_running(&srv);
+                orchestrator.mark_running(id);
 
                 if let Some(pid) = child.id() {
-                    spawned.push((srv.clone(), pid));
+                    spawned.push((id, pid));
                 }
-                let tx = tx.clone();
-                let shutdown_rx = shutdown_rx.clone();
-                tokio::spawn(async move {
-                    monitor_srv(srv, service, child, tx, shutdown_rx, SHUTDOWN_GRACE_PERIOD).await;
-                });
+                tokio::spawn(monitor_srv(
+                    id,
+                    service.ready_condition,
+                    child,
+                    tx.clone(),
+                    shutdown_rx.clone(),
+                    SHUTDOWN_GRACE_PERIOD,
+                ));
             }
             Err(e) => {
                 logger.orchestrator(
@@ -157,8 +174,8 @@ fn spawn_fulfilled<W: Write>(
                     &format!("failed to spawn {name} [{srv}]: {e}"),
                 );
 
-                let skipped = orchestrator.mark_failed(&srv);
-                log_skipped(logger, &srv, skipped);
+                let skipped = orchestrator.mark_failed(id);
+                log_skipped(logger, registry, srv, skipped);
             }
         }
     }

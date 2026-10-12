@@ -3,7 +3,6 @@ use std::{
     future::pending,
     net::SocketAddr,
     process::{ExitStatus, Stdio},
-    sync::Arc,
     time::Duration,
 };
 
@@ -15,7 +14,10 @@ use tokio::{
     time::{Instant, sleep, timeout},
 };
 
-use crate::config::{ReadyCondition, Service};
+use crate::{
+    config::{ReadyCondition, Service},
+    registry::ServiceId,
+};
 
 #[derive(Debug)]
 pub enum SpawnError {
@@ -38,7 +40,7 @@ impl From<std::io::Error> for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
-pub fn spawn_srv(_key: &str, srv: &Service) -> Result<Child, SpawnError> {
+pub fn spawn_srv(srv: &Service) -> Result<Child, SpawnError> {
     let child = Command::new("sh")
         .arg("-c")
         .arg(&srv.command)
@@ -57,10 +59,10 @@ pub enum OutputStream {
 
 #[derive(Debug)]
 pub enum ServiceEvent {
-    Ready(String),
-    Exit(String, ExitStatus),
-    Failed(String, String),
-    Output(String, OutputStream, String),
+    Ready(ServiceId),
+    Exit(ServiceId, ExitStatus),
+    Failed(ServiceId, String),
+    Output(ServiceId, OutputStream, String),
 }
 
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
@@ -108,8 +110,8 @@ fn signal_group(gpid: i32, sig: i32) {
 }
 
 pub async fn monitor_srv(
-    id: String,
-    srv: Arc<Service>,
+    id: ServiceId,
+    ready_condition: ReadyCondition,
     mut proc: Child,
     tx: UnboundedSender<ServiceEvent>,
     mut shutdown: watch::Receiver<bool>,
@@ -118,7 +120,7 @@ pub async fn monitor_srv(
     let mut stdout = proc.stdout.take().map(|out| BufReader::new(out).lines());
     let mut stderr = proc.stderr.take().map(|err| BufReader::new(err).lines());
 
-    let ready = await_ready(&srv.ready_condition);
+    let ready = await_ready(&ready_condition);
     let shutdown_timer = tokio::time::sleep(shutdown_grace_period);
     tokio::pin!(ready);
     tokio::pin!(shutdown_timer);
@@ -139,11 +141,11 @@ pub async fn monitor_srv(
 
         let event = tokio::select! {
             line = next_line(&mut stdout) => match line {
-                Some(line) => ServiceEvent::Output(id.clone(), OutputStream::StdOut, line),
+                Some(line) => ServiceEvent::Output(id, OutputStream::StdOut, line),
                 None => { stdout = None; continue; }
             },
             line = next_line(&mut stderr) => match line {
-                Some(line) => ServiceEvent::Output(id.clone(), OutputStream::StdErr, line),
+                Some(line) => ServiceEvent::Output(id, OutputStream::StdErr, line),
                 None => { stderr = None; continue; }
             },
             waited = proc.wait(), if status.is_none() => {
@@ -159,12 +161,12 @@ pub async fn monitor_srv(
                 };
                 status = Some(waited);
 
-                match srv.ready_condition {
+                match ready_condition {
                     ReadyCondition::ExitCode(code)
                         if !is_ready && exited_with_code(waited, code) =>
                     {
                         is_ready = true;
-                        ServiceEvent::Ready(id.clone())
+                        ServiceEvent::Ready(id)
                     }
                     _ => continue,
                 }
@@ -185,7 +187,7 @@ pub async fn monitor_srv(
             },
             () = &mut ready, if !is_ready => {
                 is_ready = true;
-                ServiceEvent::Ready(id.clone())
+                ServiceEvent::Ready(id)
             }
         };
 
@@ -205,6 +207,8 @@ mod tests {
     /// SIGKILL, so only tests that ask for a short grace period see one.
     const GRACE: Duration = Duration::from_secs(5);
 
+    const TEST_ID: ServiceId = ServiceId::new(0);
+
     fn service(command: &str, ready_condition: ReadyCondition) -> Service {
         Service {
             name: None,
@@ -215,13 +219,13 @@ mod tests {
     }
 
     async fn run(command: &str, ready_condition: ReadyCondition) -> Vec<ServiceEvent> {
-        let srv = Arc::new(service(command, ready_condition));
-        let proc = spawn_srv("test", &srv).unwrap();
+        let srv = service(command, ready_condition);
+        let proc = spawn_srv(&srv).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         // Held for the whole run: dropping the sender counts as a shutdown.
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        monitor_srv("test".to_owned(), srv, proc, tx, shutdown_rx, GRACE).await;
+        monitor_srv(TEST_ID, srv.ready_condition, proc, tx, shutdown_rx, GRACE).await;
 
         collect(&mut rx).await
     }
@@ -256,13 +260,13 @@ mod tests {
         watch::Sender<bool>,
         JoinHandle<()>,
     ) {
-        let srv = Arc::new(service(command, ReadyCondition::Immediate));
-        let proc = spawn_srv("test", &srv).unwrap();
+        let srv = service(command, ReadyCondition::Immediate);
+        let proc = spawn_srv(&srv).unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let monitor = tokio::spawn(monitor_srv(
-            "test".to_owned(),
-            srv,
+            TEST_ID,
+            srv.ready_condition,
             proc,
             tx,
             shutdown_rx,
@@ -306,11 +310,11 @@ mod tests {
         }
     }
 
-    fn ready_ids(events: &[ServiceEvent]) -> Vec<&str> {
+    fn ready_ids(events: &[ServiceEvent]) -> Vec<ServiceId> {
         events
             .iter()
             .filter_map(|event| match event {
-                ServiceEvent::Ready(id) => Some(id.as_str()),
+                ServiceEvent::Ready(id) => Some(*id),
                 _ => None,
             })
             .collect()
@@ -358,15 +362,15 @@ mod tests {
     async fn reports_output_from_both_streams_before_exit() {
         let events = run("sh -c 'echo one; echo two >&2'", ReadyCondition::Immediate).await;
 
-        let mut lines: Vec<(&str, &str)> = events
+        let mut lines: Vec<(ServiceId, &str)> = events
             .iter()
             .filter_map(|event| match event {
-                ServiceEvent::Output(id, _, line) => Some((id.as_str(), line.as_str())),
+                ServiceEvent::Output(id, _, line) => Some((*id, line.as_str())),
                 _ => None,
             })
             .collect();
-        lines.sort();
-        assert_eq!(lines, [("test", "one"), ("test", "two")]);
+        lines.sort_by_key(|&(_, line)| line);
+        assert_eq!(lines, [(TEST_ID, "one"), (TEST_ID, "two")]);
 
         assert!(matches!(events.first(), Some(ServiceEvent::Ready(_))));
         assert!(matches!(events.last(), Some(ServiceEvent::Exit(_, _))));
@@ -403,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn ready_fires_once_and_only_on_a_matching_exit_code() {
         let events = run("sh -c 'exit 7'", ReadyCondition::ExitCode(7)).await;
-        assert_eq!(ready_ids(&events), ["test"]);
+        assert_eq!(ready_ids(&events), [TEST_ID]);
 
         let events = run("sh -c 'exit 1'", ReadyCondition::ExitCode(7)).await;
         assert!(ready_ids(&events).is_empty());
@@ -436,14 +440,14 @@ mod tests {
     async fn monitor_runs_as_an_independent_spawned_task() {
         // Owning its Service and Child is what makes the monitor 'static, so
         // the supervisor can spawn one per service instead of driving them all.
-        let srv = Arc::new(service("sh -c 'echo hi'", ReadyCondition::Immediate));
-        let proc = spawn_srv("test", &srv).unwrap();
+        let srv = service("sh -c 'echo hi'", ReadyCondition::Immediate);
+        let proc = spawn_srv(&srv).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let handle = tokio::spawn(monitor_srv(
-            "test".to_owned(),
-            srv,
+            TEST_ID,
+            srv.ready_condition,
             proc,
             tx,
             shutdown_rx,
@@ -461,18 +465,15 @@ mod tests {
 
     #[tokio::test]
     async fn monitor_gives_up_once_the_receiver_is_gone() {
-        let srv = Arc::new(service(
-            "sh -c 'echo hi; sleep 1'",
-            ReadyCondition::Immediate,
-        ));
-        let proc = spawn_srv("test", &srv).unwrap();
+        let srv = service("sh -c 'echo hi; sleep 1'", ReadyCondition::Immediate);
+        let proc = spawn_srv(&srv).unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
         // Kept alive so the monitor can only stop because the receiver is
         // gone, not because a dropped sender reads as a shutdown.
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let monitor = monitor_srv("test".to_owned(), srv, proc, tx, shutdown_rx, GRACE);
+        let monitor = monitor_srv(TEST_ID, srv.ready_condition, proc, tx, shutdown_rx, GRACE);
         assert!(
             timeout(Duration::from_millis(500), monitor).await.is_ok(),
             "monitor outlived its receiver"
@@ -485,7 +486,7 @@ mod tests {
         // the terminal Exit before the timer fires, and never reports ready.
         let started = Instant::now();
         let events = run("sleep 1", ReadyCondition::Delay(100)).await;
-        assert_eq!(ready_ids(&events), ["test"]);
+        assert_eq!(ready_ids(&events), [TEST_ID]);
 
         let ready_at = events
             .iter()
