@@ -63,3 +63,7 @@ Kickstart supports a variety of readiness conditions. Once a service is marked r
 - Port: Service is marked ready when the specified port begins accepting connections
 - Exit code: Service is marked ready when it exits with the specified exit code
 - Delay: Service is marked ready after the specified delay milliseconds pass since starting
+
+## Examples
+
+See the `examples/basic` for a basic example config.
