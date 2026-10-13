@@ -28,6 +28,7 @@ pub async fn run(config: &KickstartConfig) {
     let registry = Registry::new(config);
     let mut orchestrator = Orchestrator::new(&registry);
     let mut shutting_down = false;
+    let mut announced_ready = false;
 
     logger.register(config.services.keys().map(String::as_str));
 
@@ -117,10 +118,30 @@ pub async fn run(config: &KickstartConfig) {
             ));
         }
 
+        if !shutting_down && !announced_ready && orchestrator.settled() {
+            announced_ready = true;
+            announce_ready(&mut logger, &registry, &orchestrator);
+        }
+
         if orchestrator.all_ended_or_skipped() {
             break;
         }
     }
+}
+
+fn announce_ready<W: Write>(
+    logger: &mut Logger<W>,
+    registry: &Registry,
+    orchestrator: &Orchestrator,
+) {
+    logger.blank();
+    logger.orchestrator(Level::Success, "All Ready!");
+    let skipped = orchestrator.skipped();
+    if !skipped.is_empty() {
+        let ids: Vec<_> = skipped.into_iter().map(|id| registry.id(id)).collect();
+        logger.orchestrator(Level::Notice, &format!("skipped: {}", ids.join(", ")));
+    }
+    logger.blank();
 }
 
 fn log_skipped<W: Write>(

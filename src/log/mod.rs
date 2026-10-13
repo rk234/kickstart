@@ -14,6 +14,8 @@ pub enum Level {
     Info,
     Notice,
     Error,
+    /// A milestone the user should notice, like every service being ready.
+    Success,
 }
 
 pub struct Logger<W: Write> {
@@ -61,6 +63,11 @@ impl<W: Write> Logger<W> {
         self.log(ORCHESTRATOR, level, msg);
     }
 
+    /// An empty line, to set a message apart from the output around it.
+    pub fn blank(&mut self) {
+        let _ = writeln!(self.out);
+    }
+
     fn widen(&mut self, sender: &str) {
         self.label_width = self.label_width.max(label_width(sender));
     }
@@ -76,6 +83,7 @@ impl<W: Write> Logger<W> {
         self.widen(sender);
 
         let red = Some(AnsiColor::Red.into());
+        let green = Some(AnsiColor::Green.into());
         let (prefix, body) = match level {
             Level::Info => (label_style, body_style),
             Level::Notice => (Style::new().fg_color(red), body_style),
@@ -85,6 +93,13 @@ impl<W: Write> Logger<W> {
                     .bg_color(red)
                     .bold(),
                 Style::new().fg_color(red),
+            ),
+            Level::Success => (
+                Style::new()
+                    .fg_color(Some(AnsiColor::BrightWhite.into()))
+                    .bg_color(green)
+                    .bold(),
+                Style::new().fg_color(green).bold(),
             ),
         };
         let base = (body != Style::new()).then_some(body);
@@ -168,6 +183,25 @@ mod tests {
             "{out:?}"
         );
         assert!(out.contains("\x1b[31mboom\x1b[0m"), "{out:?}");
+    }
+
+    #[test]
+    fn successes_have_a_green_background_prefix_and_a_bold_green_body() {
+        let out = output(|log| log.orchestrator(Level::Success, "All Ready!"));
+        assert!(
+            out.starts_with("\x1b[1m\x1b[97m\x1b[42m[orchestrator]"),
+            "{out:?}"
+        );
+        assert!(out.contains("\x1b[1m\x1b[32mAll Ready!\x1b[0m"), "{out:?}");
+    }
+
+    #[test]
+    fn blank_writes_an_empty_line() {
+        let out = output(|log| {
+            log.blank();
+            log.orchestrator(Level::Info, "x");
+        });
+        assert!(out.starts_with('\n'), "{out:?}");
     }
 
     #[test]

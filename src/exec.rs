@@ -89,7 +89,7 @@ async fn await_port(port: u16) {
 async fn await_ready(cond: &ReadyCondition) {
     match *cond {
         ReadyCondition::Immediate => {}
-        ReadyCondition::Delay(secs) => sleep(Duration::from_millis(secs)).await,
+        ReadyCondition::Delay(millis) => sleep(Duration::from_millis(millis)).await,
         ReadyCondition::Port(port) => await_port(port).await,
         ReadyCondition::ExitCode(_) => pending().await,
     }

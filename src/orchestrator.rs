@@ -17,7 +17,6 @@ pub enum EndOutcome {
     Failed { skipped: Vec<ServiceId> },
 }
 
-/// Per-service state, indexed by `ServiceId`.
 pub struct Orchestrator {
     status: Vec<ServiceStatus>,
     dependents: Vec<Vec<ServiceId>>,
@@ -129,6 +128,26 @@ impl Orchestrator {
             .collect()
     }
 
+    /// True once nothing is left waiting to start or become ready: every
+    /// service is up, has ended, or was skipped.
+    pub fn settled(&self) -> bool {
+        self.status.iter().all(|status| {
+            matches!(
+                status,
+                ServiceStatus::Up | ServiceStatus::Ended | ServiceStatus::Skipped
+            )
+        })
+    }
+
+    pub fn skipped(&self) -> Vec<ServiceId> {
+        self.status
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| matches!(s, ServiceStatus::Skipped))
+            .map(|(i, _)| ServiceId::new(i))
+            .collect()
+    }
+
     pub fn all_ended_or_skipped(&self) -> bool {
         self.status.iter().all(|status| {
             matches!(status, ServiceStatus::Ended) || matches!(status, ServiceStatus::Skipped)
@@ -193,6 +212,14 @@ mod tests {
 
         fn all_ended_or_skipped(&self) -> bool {
             self.orch.all_ended_or_skipped()
+        }
+
+        fn settled(&self) -> bool {
+            self.orch.settled()
+        }
+
+        fn skipped(&self) -> Vec<&'static str> {
+            self.names(self.orch.skipped())
         }
     }
 
@@ -543,5 +570,47 @@ mod tests {
         orch.mark_ready("db");
 
         assert!(fulfilled(&orch).is_empty());
+    }
+
+    // --- settled ---
+
+    #[test]
+    fn not_settled_while_services_wait_or_are_starting() {
+        let mut orch = orchestrator(&[("db", &[]), ("web", &["db"])]);
+        assert!(!orch.settled());
+
+        orch.mark_running("db");
+        // `db` is spawned but not ready yet, and `web` is still waiting on it.
+        assert!(!orch.settled());
+
+        orch.mark_ready("db");
+        assert!(!orch.settled());
+    }
+
+    #[test]
+    fn settled_once_every_service_is_up() {
+        let mut orch = orchestrator(&[("db", &[]), ("web", &["db"])]);
+        orch.mark_running("db");
+        orch.mark_ready("db");
+        orch.mark_running("web");
+        orch.mark_ready("web");
+        assert!(orch.settled());
+        assert!(orch.skipped().is_empty());
+    }
+
+    #[test]
+    fn settled_after_a_failure_reports_the_skipped_services() {
+        let mut orch = orchestrator(&[("db", &[]), ("web", &["db"]), ("app", &["web"])]);
+        orch.mark_running("db");
+        orch.mark_ended("db");
+        assert!(orch.settled());
+        assert_eq!(orch.skipped(), ["app", "web"]);
+    }
+
+    #[test]
+    fn services_that_exited_after_becoming_ready_count_as_settled() {
+        let mut orch = orchestrator(&[("migrate", &[])]);
+        run_to_completion(&mut orch, "migrate");
+        assert!(orch.settled());
     }
 }
