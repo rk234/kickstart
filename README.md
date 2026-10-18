@@ -32,6 +32,16 @@ Kickstart will create a DAG from your configuration and execute each service in 
 <img width="800" height="458" alt="kickstart" src="https://github.com/user-attachments/assets/ed107c27-10ee-440c-9f39-b191ec9d586c" />
 </p>
 
+## Installing
+
+Clone the repo, then install with `cargo install`:
+
+```sh
+$ git clone https://github.com/rk234/kickstart
+$ cd kickstart
+$ cargo install --path .
+```
+
 ## Commands
 
 Configuration is loaded from the current working directory by default. You can specify an alternative config file with the `--config` flag. There are two commands:
