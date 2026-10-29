@@ -1,12 +1,102 @@
+use regex::Regex;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    str::FromStr,
 };
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub type Env = HashMap<String, String>;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum Var<T: FromStr + Clone> {
+    Literal(T),
+    Expr(String),
+}
+
+#[derive(Debug)]
+pub enum ResolveError {
+    EnvParseFail(String),
+    DefaultParseFail(String),
+    InvalidExpr(String),
+}
+
+impl Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                ResolveError::EnvParseFail(env) =>
+                    format!("failed to parse environment variable: {}", env),
+                ResolveError::DefaultParseFail(def) => format!("failed to parse default: {}", def),
+                ResolveError::InvalidExpr(expr) => format!("invalid expression: {}", expr),
+            }
+        )
+    }
+}
+
+impl<T: FromStr + Clone> Var<T> {
+    pub fn resolve(&self, env: &Env) -> Result<T, ResolveError> {
+        match self {
+            Var::Literal(val) => Ok(val.clone()),
+            Var::Expr(expr) => {
+                let re = Regex::new(r"^{([A-Z_][A-Z0-9_]*)(:-(.+))?}$").unwrap();
+
+                if let Some(caps) = re.captures(expr) {
+                    let env_var = caps
+                        .get(1)
+                        .map(|c| c.as_str())
+                        .ok_or(ResolveError::InvalidExpr(expr.clone()))?;
+                    let default = caps.get(2).map(|c| c.as_str());
+
+                    if let Some(val) = env.get(env_var) {
+                        let result = val
+                            .parse()
+                            .ok()
+                            .ok_or(ResolveError::EnvParseFail(val.clone()))?;
+
+                        Ok(result)
+                    } else {
+                        let default = default.ok_or(ResolveError::InvalidExpr(expr.clone()))?;
+                        let default_val = default
+                            .parse()
+                            .ok()
+                            .ok_or(ResolveError::DefaultParseFail(String::from(default)))?;
+
+                        Ok(default_val)
+                    }
+                } else {
+                    Err(ResolveError::InvalidExpr(expr.clone()))
+                }
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "lowercase")]
+pub enum RawReadyCondition {
+    ExitCode(Var<i32>),
+    Port(Var<u16>),
+    Delay(Var<u64>),
+    Immediate,
+}
+
+impl RawReadyCondition {
+    fn resolve(&self, env: &Env) -> Result<ReadyCondition, ResolveError> {
+        Ok(match self {
+            RawReadyCondition::ExitCode(var) => ReadyCondition::ExitCode(var.resolve(env)?),
+            RawReadyCondition::Port(var) => ReadyCondition::Port(var.resolve(env)?),
+            RawReadyCondition::Delay(var) => ReadyCondition::Delay(var.resolve(env)?),
+            RawReadyCondition::Immediate => ReadyCondition::Immediate,
+        })
+    }
+}
+
+#[derive(Serialize, Debug, Clone, Copy)]
 pub enum ReadyCondition {
     ExitCode(i32),
     Port(u16),
@@ -15,15 +105,50 @@ pub enum ReadyCondition {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Service {
+pub struct RawService {
     pub name: Option<String>,
     pub command: String,
-    pub ready_condition: ReadyCondition,
+    pub ready_condition: RawReadyCondition,
     #[serde(default)]
     pub depends_on: Vec<String>,
 }
 
+#[derive(Debug)]
+pub struct Service {
+    pub name: Option<String>,
+    pub command: String,
+    pub ready_condition: ReadyCondition,
+    pub depends_on: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
+pub struct RawKickstartConfig {
+    pub services: HashMap<String, RawService>,
+}
+
+impl RawKickstartConfig {
+    fn resolve(&self, env: &Env) -> Result<KickstartConfig, ResolveError> {
+        let services: HashMap<String, Service> = self
+            .services
+            .iter()
+            .map::<Result<(String, Service), ResolveError>, _>(|(key, s)| {
+                let cond = s.ready_condition.resolve(env)?;
+                Ok((
+                    key.clone(),
+                    Service {
+                        name: s.name.clone(),
+                        command: s.command.clone(),
+                        ready_condition: cond,
+                        depends_on: s.depends_on.clone(),
+                    },
+                ))
+            })
+            .collect::<Result<HashMap<String, Service>, ResolveError>>()?;
+
+        Ok(KickstartConfig { services })
+    }
+}
+
 pub struct KickstartConfig {
     pub services: HashMap<String, Service>,
 }
@@ -124,6 +249,7 @@ impl KickstartConfig {
 pub enum LoadError {
     IoError(std::io::Error),
     DeserializeError(toml::de::Error),
+    ResolveError(ResolveError),
 }
 
 impl Display for LoadError {
@@ -131,6 +257,9 @@ impl Display for LoadError {
         match self {
             LoadError::IoError(err) => write!(f, "failed to read config file: {}", err),
             LoadError::DeserializeError(err) => write!(f, "failed to parse config file: {}", err),
+            LoadError::ResolveError(err) => {
+                write!(f, "failed to resolve environment variables: {}", err)
+            }
         }
     }
 }
@@ -149,21 +278,28 @@ impl From<toml::de::Error> for LoadError {
     }
 }
 
+impl From<ResolveError> for LoadError {
+    fn from(value: ResolveError) -> Self {
+        Self::ResolveError(value)
+    }
+}
+
 const DEFAULT_CONFIG_PATH: &str = "kickstart.toml";
 
 pub fn read_config(path: Option<&str>) -> Result<String, std::io::Error> {
     std::fs::read_to_string(path.unwrap_or(DEFAULT_CONFIG_PATH))
 }
 
-pub fn parse_config(cfg: &str) -> Result<KickstartConfig, toml::de::Error> {
+pub fn parse_config(cfg: &str) -> Result<RawKickstartConfig, toml::de::Error> {
     let config = toml::from_str(cfg)?;
     Ok(config)
 }
 
-pub fn load_config(cfg: Option<&str>) -> Result<KickstartConfig, LoadError> {
+pub fn load_config(cfg: Option<&str>, env: &Env) -> Result<KickstartConfig, LoadError> {
     let content = read_config(cfg)?;
     let cfg = parse_config(content.as_str())?;
-    Ok(cfg)
+    let resolved = cfg.resolve(env)?;
+    Ok(resolved)
 }
 
 #[cfg(test)]

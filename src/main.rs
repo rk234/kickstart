@@ -19,8 +19,9 @@ async fn dispatch(cli: &Cli, config: &KickstartConfig) {
 #[tokio::main]
 async fn main() {
     let cli = cli::Cli::parse();
+    let env = std::env::vars().collect();
 
-    let config = match config::load_config(cli.config.as_deref()) {
+    let config = match config::load_config(cli.config.as_deref(), &env) {
         Ok(config) => config,
         Err(err) => {
             eprintln!("{}", err);
