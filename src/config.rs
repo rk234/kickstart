@@ -273,17 +273,17 @@ impl KickstartConfig {
 
 #[derive(Debug)]
 pub enum LoadError {
-    IoError(std::io::Error),
-    DeserializeError(toml::de::Error),
-    ResolveError(ResolveError),
+    Io(std::io::Error),
+    Deserialize(toml::de::Error),
+    Resolve(ResolveError),
 }
 
 impl Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LoadError::IoError(err) => write!(f, "failed to read config file: {}", err),
-            LoadError::DeserializeError(err) => write!(f, "failed to parse config file: {}", err),
-            LoadError::ResolveError(err) => {
+            LoadError::Io(err) => write!(f, "failed to read config file: {}", err),
+            LoadError::Deserialize(err) => write!(f, "failed to parse config file: {}", err),
+            LoadError::Resolve(err) => {
                 write!(f, "failed to resolve environment variables: {}", err)
             }
         }
@@ -294,19 +294,19 @@ impl std::error::Error for LoadError {}
 
 impl From<std::io::Error> for LoadError {
     fn from(value: std::io::Error) -> Self {
-        Self::IoError(value)
+        Self::Io(value)
     }
 }
 
 impl From<toml::de::Error> for LoadError {
     fn from(value: toml::de::Error) -> Self {
-        Self::DeserializeError(value)
+        Self::Deserialize(value)
     }
 }
 
 impl From<ResolveError> for LoadError {
     fn from(value: ResolveError) -> Self {
-        Self::ResolveError(value)
+        Self::Resolve(value)
     }
 }
 
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn load_config_errors_on_missing_file() {
         let result = load_config(Some("/nonexistent/path/kickstart.toml"), &Env::new());
-        assert!(matches!(result, Err(LoadError::IoError(_))));
+        assert!(matches!(result, Err(LoadError::Io(_))));
     }
 
     #[test]
@@ -469,14 +469,14 @@ mod tests {
         std::fs::write(&path, "this is not valid toml [[[").unwrap();
 
         let result = load_config(Some(path.to_str().unwrap()), &Env::new());
-        assert!(matches!(result, Err(LoadError::DeserializeError(_))));
+        assert!(matches!(result, Err(LoadError::Deserialize(_))));
 
         std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn load_error_display_messages() {
-        let io_err = LoadError::IoError(std::io::Error::new(std::io::ErrorKind::NotFound, "nope"));
+        let io_err = LoadError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "nope"));
         assert!(io_err.to_string().contains("failed to read config file"));
 
         let toml_err = parse_config("bad [[[").unwrap_err();
