@@ -78,6 +78,16 @@ Kickstart supports a variety of readiness conditions. Once a service is marked r
 - Exit code: Service is marked ready when it exits with the specified exit code
 - Delay: Service is marked ready after the specified delay milliseconds pass since starting
 
+### Environment variables
+
+Ready condition values can reference environment variables with `{VAR}` or `{VAR:-default}`:
+
+```toml
+ready_condition = { port = "{BACKEND_PORT:-8000}" }
+```
+
+Kickstart loads `.env` from the current directory by default if it exists, or a different file passed with `--env`. Variables already set in your shell take precedence over the file. Loaded variables are also passed to each service's command.
+
 ## Examples
 
-See the `examples/basic` for a basic example config.
+See the `examples/basic` for a basic example config, and `examples/env` for the same setup with its ports set in a `.env` file, used both in the ready conditions and by the services themselves.
