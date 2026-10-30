@@ -79,7 +79,7 @@ impl<'a> Registry<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::parse_config;
+    use crate::config::{Env, parse_config};
 
     fn config() -> KickstartConfig {
         parse_config(
@@ -98,6 +98,8 @@ mod tests {
             ready_condition = "immediate"
             "#,
         )
+        .unwrap()
+        .resolve(&Env::new())
         .unwrap()
     }
 

@@ -3,17 +3,44 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
     str::FromStr,
+    sync::LazyLock,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 pub type Env = HashMap<String, String>;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+static EXPR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\{([A-Z_][A-Z0-9_]*)(:-(.+))?\}$").unwrap());
+
+#[derive(Serialize, Debug, Clone)]
 #[serde(untagged)]
-pub enum Var<T: FromStr + Clone> {
+pub enum Var<T> {
     Literal(T),
     Expr(String),
+}
+
+impl<'de, T> Deserialize<'de> for Var<T>
+where
+    T: Deserialize<'de> + FromStr,
+{
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw<T> {
+            Str(String),
+            Other(T),
+        }
+
+        match Raw::<T>::deserialize(d)? {
+            Raw::Str(s) if EXPR_RE.is_match(&s) => Ok(Var::Expr(s)),
+            Raw::Str(s) => s
+                .parse()
+                .map(Var::Literal)
+                .map_err(|_| D::Error::custom(format!("invalid value: {s:?}"))),
+            Raw::Other(val) => Ok(Var::Literal(val)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -43,14 +70,12 @@ impl<T: FromStr + Clone> Var<T> {
         match self {
             Var::Literal(val) => Ok(val.clone()),
             Var::Expr(expr) => {
-                let re = Regex::new(r"^{([A-Z_][A-Z0-9_]*)(:-(.+))?}$").unwrap();
-
-                if let Some(caps) = re.captures(expr) {
+                if let Some(caps) = EXPR_RE.captures(expr) {
                     let env_var = caps
                         .get(1)
                         .map(|c| c.as_str())
                         .ok_or(ResolveError::InvalidExpr(expr.clone()))?;
-                    let default = caps.get(2).map(|c| c.as_str());
+                    let default = caps.get(3).map(|c| c.as_str());
 
                     if let Some(val) = env.get(env_var) {
                         let result = val
@@ -97,6 +122,7 @@ impl RawReadyCondition {
 }
 
 #[derive(Serialize, Debug, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
 pub enum ReadyCondition {
     ExitCode(i32),
     Port(u16),
@@ -127,7 +153,7 @@ pub struct RawKickstartConfig {
 }
 
 impl RawKickstartConfig {
-    fn resolve(&self, env: &Env) -> Result<KickstartConfig, ResolveError> {
+    pub fn resolve(&self, env: &Env) -> Result<KickstartConfig, ResolveError> {
         let services: HashMap<String, Service> = self
             .services
             .iter()
@@ -306,16 +332,20 @@ pub fn load_config(cfg: Option<&str>, env: &Env) -> Result<KickstartConfig, Load
 mod tests {
     use super::*;
 
+    fn resolve_config(cfg: &str, vars: &[(&str, &str)]) -> KickstartConfig {
+        parse_config(cfg).unwrap().resolve(&env(vars)).unwrap()
+    }
+
     #[test]
     fn parses_minimal_service() {
-        let cfg = parse_config(
+        let cfg = resolve_config(
             r#"
             [services.web]
             command = "echo hi"
             ready_condition = "immediate"
             "#,
-        )
-        .unwrap();
+            &[],
+        );
 
         let web = cfg.services.get("web").unwrap();
         assert_eq!(web.command, "echo hi");
@@ -326,7 +356,7 @@ mod tests {
 
     #[test]
     fn parses_full_service_with_dependencies() {
-        let cfg = parse_config(
+        let cfg = resolve_config(
             r#"
             [services.db]
             command = "postgres"
@@ -338,8 +368,8 @@ mod tests {
             ready_condition = { exitcode = 0 }
             depends_on = ["db"]
             "#,
-        )
-        .unwrap();
+            &[],
+        );
 
         assert_eq!(cfg.services.len(), 2);
 
@@ -419,7 +449,7 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = load_config(Some(path.to_str().unwrap())).unwrap();
+        let cfg = load_config(Some(path.to_str().unwrap()), &Env::new()).unwrap();
         let web = cfg.services.get("web").unwrap();
         assert_eq!(web.command, "echo hi");
 
@@ -428,7 +458,7 @@ mod tests {
 
     #[test]
     fn load_config_errors_on_missing_file() {
-        let result = load_config(Some("/nonexistent/path/kickstart.toml"));
+        let result = load_config(Some("/nonexistent/path/kickstart.toml"), &Env::new());
         assert!(matches!(result, Err(LoadError::IoError(_))));
     }
 
@@ -438,7 +468,7 @@ mod tests {
         let path = dir.join(format!("kickstart_load_bad_{}.toml", std::process::id()));
         std::fs::write(&path, "this is not valid toml [[[").unwrap();
 
-        let result = load_config(Some(path.to_str().unwrap()));
+        let result = load_config(Some(path.to_str().unwrap()), &Env::new());
         assert!(matches!(result, Err(LoadError::DeserializeError(_))));
 
         std::fs::remove_file(&path).unwrap();
@@ -452,6 +482,148 @@ mod tests {
         let toml_err = parse_config("bad [[[").unwrap_err();
         let load_err = LoadError::from(toml_err);
         assert!(load_err.to_string().contains("failed to parse config file"));
+    }
+
+    #[derive(Deserialize)]
+    struct Holder<T: FromStr> {
+        v: Var<T>,
+    }
+
+    fn var<T: for<'de> Deserialize<'de> + FromStr>(toml_value: &str) -> Var<T> {
+        toml::from_str::<Holder<T>>(&format!("v = {toml_value}"))
+            .unwrap()
+            .v
+    }
+
+    fn env(vars: &[(&str, &str)]) -> Env {
+        vars.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn string_var_distinguishes_literals_from_expressions() {
+        assert!(matches!(var::<String>(r#""hello""#), Var::Literal(s) if s == "hello"));
+        assert!(matches!(var::<String>(r#""{HOST}""#), Var::Expr(s) if s == "{HOST}"));
+        assert!(matches!(
+            var::<String>(r#""{HOST:-localhost}""#),
+            Var::Expr(s) if s == "{HOST:-localhost}"
+        ));
+    }
+
+    #[test]
+    fn string_var_treats_non_matching_braces_as_literal() {
+        assert!(matches!(var::<String>(r#""{lowercase}""#), Var::Literal(_)));
+        assert!(matches!(
+            var::<String>(r#""prefix {HOST}""#),
+            Var::Literal(_)
+        ));
+    }
+
+    #[test]
+    fn numeric_var_accepts_numbers_strings_and_expressions() {
+        assert!(matches!(var::<u16>("5432"), Var::Literal(5432)));
+        assert!(matches!(var::<u16>(r#""5432""#), Var::Literal(5432)));
+        assert!(matches!(var::<u16>(r#""{PORT}""#), Var::Expr(_)));
+    }
+
+    #[test]
+    fn numeric_var_rejects_unparseable_strings() {
+        let result = toml::from_str::<Holder<u16>>(r#"v = "not a port""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolves_literal_without_env() {
+        let v = var::<String>(r#""hello""#);
+        assert_eq!(v.resolve(&Env::new()).unwrap(), "hello");
+    }
+
+    #[test]
+    fn resolves_expression_from_env() {
+        let v = var::<String>(r#""{HOST:-localhost}""#);
+        assert_eq!(
+            v.resolve(&env(&[("HOST", "db.internal")])).unwrap(),
+            "db.internal"
+        );
+    }
+
+    #[test]
+    fn resolves_expression_to_default_when_unset() {
+        let v = var::<String>(r#""{HOST:-localhost}""#);
+        assert_eq!(v.resolve(&Env::new()).unwrap(), "localhost");
+
+        let v = var::<u16>(r#""{PORT:-8080}""#);
+        assert_eq!(v.resolve(&Env::new()).unwrap(), 8080);
+    }
+
+    #[test]
+    fn errors_when_unset_without_default() {
+        let v = var::<String>(r#""{HOST}""#);
+        assert!(matches!(
+            v.resolve(&Env::new()),
+            Err(ResolveError::InvalidExpr(_))
+        ));
+    }
+
+    #[test]
+    fn errors_when_env_value_fails_to_parse() {
+        let v = var::<u16>(r#""{PORT}""#);
+        let result = v.resolve(&env(&[("PORT", "abc")]));
+        assert!(matches!(result, Err(ResolveError::EnvParseFail(val)) if val == "abc"));
+    }
+
+    #[test]
+    fn errors_when_default_fails_to_parse() {
+        let v = var::<u16>(r#""{PORT:-abc}""#);
+        let result = v.resolve(&Env::new());
+        assert!(matches!(result, Err(ResolveError::DefaultParseFail(def)) if def == "abc"));
+    }
+
+    #[test]
+    fn resolves_ready_conditions_from_env() {
+        let cfg = resolve_config(
+            r#"
+            [services.db]
+            command = "postgres"
+            ready_condition = { port = "{DB_PORT:-5432}" }
+
+            [services.web]
+            command = "node server.js"
+            ready_condition = { delay = "{WEB_DELAY}" }
+            "#,
+            &[("WEB_DELAY", "250")],
+        );
+
+        assert!(matches!(
+            cfg.services["db"].ready_condition,
+            ReadyCondition::Port(5432)
+        ));
+        assert!(matches!(
+            cfg.services["web"].ready_condition,
+            ReadyCondition::Delay(250)
+        ));
+    }
+
+    #[test]
+    fn resolve_error_surfaces_through_load_error() {
+        let raw = parse_config(
+            r#"
+            [services.web]
+            command = "true"
+            ready_condition = { port = "{PORT}" }
+            "#,
+        )
+        .unwrap();
+
+        let Err(err) = raw.resolve(&Env::new()) else {
+            panic!("expected resolve to fail");
+        };
+        let err = LoadError::from(err);
+        assert!(
+            err.to_string()
+                .contains("failed to resolve environment variables")
+        );
     }
 
     fn graph(defs: &[(&str, &[&str])]) -> KickstartConfig {
