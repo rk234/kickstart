@@ -13,6 +13,11 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub config: Option<String>,
 
+    /// Optional env file path.
+    /// Default: .env
+    #[arg(short, long, global = true)]
+    pub env: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }

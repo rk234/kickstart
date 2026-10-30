@@ -74,24 +74,18 @@ impl<T: FromStr + Clone> Var<T> {
                     let env_var = caps
                         .get(1)
                         .map(|c| c.as_str())
-                        .ok_or(ResolveError::InvalidExpr(expr.clone()))?;
+                        .ok_or_else(|| ResolveError::InvalidExpr(expr.clone()))?;
                     let default = caps.get(3).map(|c| c.as_str());
 
                     if let Some(val) = env.get(env_var) {
-                        let result = val
-                            .parse()
-                            .ok()
-                            .ok_or(ResolveError::EnvParseFail(val.clone()))?;
-
-                        Ok(result)
+                        val.parse()
+                            .map_err(|_| ResolveError::EnvParseFail(val.clone()))
                     } else {
-                        let default = default.ok_or(ResolveError::InvalidExpr(expr.clone()))?;
-                        let default_val = default
+                        let default =
+                            default.ok_or_else(|| ResolveError::InvalidExpr(expr.clone()))?;
+                        default
                             .parse()
-                            .ok()
-                            .ok_or(ResolveError::DefaultParseFail(String::from(default)))?;
-
-                        Ok(default_val)
+                            .map_err(|_| ResolveError::DefaultParseFail(default.to_string()))
                     }
                 } else {
                     Err(ResolveError::InvalidExpr(expr.clone()))
@@ -154,22 +148,19 @@ pub struct RawKickstartConfig {
 
 impl RawKickstartConfig {
     pub fn resolve(&self, env: &Env) -> Result<KickstartConfig, ResolveError> {
-        let services: HashMap<String, Service> = self
+        let services = self
             .services
             .iter()
-            .map::<Result<(String, Service), ResolveError>, _>(|(key, s)| {
-                let cond = s.ready_condition.resolve(env)?;
-                Ok((
-                    key.clone(),
-                    Service {
-                        name: s.name.clone(),
-                        command: s.command.clone(),
-                        ready_condition: cond,
-                        depends_on: s.depends_on.clone(),
-                    },
-                ))
+            .map(|(key, s)| {
+                let service = Service {
+                    name: s.name.clone(),
+                    command: s.command.clone(),
+                    ready_condition: s.ready_condition.resolve(env)?,
+                    depends_on: s.depends_on.clone(),
+                };
+                Ok((key.clone(), service))
             })
-            .collect::<Result<HashMap<String, Service>, ResolveError>>()?;
+            .collect::<Result<_, _>>()?;
 
         Ok(KickstartConfig { services })
     }
